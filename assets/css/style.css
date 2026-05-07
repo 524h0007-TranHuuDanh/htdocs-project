@@ -1,0 +1,27 @@
+/* Chế độ Grid (Mặc định) - Hiển thị nhiều cột trên Desktop */
+.note-grid-view {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+
+.note-grid-view .note-item {
+    width: calc(33.333% - 20px); /* 3 cột trên desktop */
+}
+
+/* Chế độ List - Mỗi ghi chú một dòng */
+.note-list-view {
+    display: block;
+}
+
+.note-list-view .note-item {
+    width: 100%;
+    margin-bottom: 15px;
+}
+
+/* Responsive cho điện thoại (Tiêu chí 26) */
+@media (max-width: 768px) {
+    .note-grid-view .note-item {
+        width: 100%; /* Trên mobile luôn hiển thị 1 cột */
+    }
+}
