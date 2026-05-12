@@ -1,10 +1,17 @@
 <?php
-require __DIR__ . '/../vendor/autoload.php';
+// websocket/server.php
 
-use Ratchet\Server\IoServer;
+require_once __DIR__ . '/../vendor/autoload.php';
+
 use Ratchet\Http\HttpServer;
+use Ratchet\Server\IoServer;
 use Ratchet\WebSocket\WsServer;
+
 use App\NoteWebSocket;
+
+// =====================================================
+// WEBSOCKET SERVER
+// =====================================================
 
 $server = IoServer::factory(
     new HttpServer(
@@ -12,10 +19,9 @@ $server = IoServer::factory(
             new NoteWebSocket()
         )
     ),
-    8080  // Port WebSocket - KHÔNG đổi nếu chưa biết
+    8080
 );
 
-echo "🚀 WebSocket Server NoteApp đang chạy trên ws://localhost:8080\n";
-echo "Nhấn Ctrl + C để dừng server...\n";
+echo "🚀 WebSocket running at ws://localhost:8080\n";
 
 $server->run();
