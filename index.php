@@ -521,7 +521,6 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     if (isShared && permission === 'edit') startAutoRefresh();
     noteModal.show();
 }
-
 // ====================== AUTO REFRESH ======================
 function startAutoRefresh() {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
