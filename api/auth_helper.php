@@ -20,4 +20,34 @@ function check_login() {
         header("Location: login.php");
         exit();
     }
+    ensure_session_csrf_token();
+}
+
+/**
+ * Ensures a session-bound CSRF secret exists for authenticated flows.
+ */
+function ensure_session_csrf_token(): void {
+    if (empty($_SESSION['csrf_token']) || !is_string($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+}
+
+/**
+ * Rejects POST when CSRF token is missing, wrong type, or not hash_equals to session value.
+ */
+function require_valid_csrf_post(): void {
+    $sent = $_POST['csrf_token'] ?? null;
+    $sess  = $_SESSION['csrf_token'] ?? null;
+    if (!is_string($sess) || $sess === '' || !is_string($sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ (CSRF).']);
+        exit;
+    }
+    if (!hash_equals($sess, $sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ (CSRF).']);
+        exit;
+    }
 }

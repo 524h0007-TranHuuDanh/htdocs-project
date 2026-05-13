@@ -3,6 +3,7 @@ require_once 'auth_helper.php';
 require_once '../database.php';
 
 check_login();
+require_valid_csrf_post();
 
 header('Content-Type: application/json');
 
@@ -78,6 +79,8 @@ try {
     $stmt = $pdo->prepare("
         SELECT
             n.version,
+            n.title,
+            n.content,
             n.user_id,
             (
                 SELECT permission
@@ -115,44 +118,67 @@ try {
     }
 
     // =========================================================
-    // VERSION CONFLICT CHECK
+    // VERSION CHECK + ATOMIC UPDATE (optimistic locking)
+    // Client must match current server version; UPDATE only if row still at that version.
     // =========================================================
-    if (
-        $client_version > 0 &&
-        $client_version < ($note['version'] - 3)
-    ) {
+    $serverVersion = (int) $note['version'];
+
+    if ((int) $client_version !== $serverVersion) {
 
         echo json_encode([
-            'success'  => false,
-            'conflict' => true,
-            'version'  => $note['version'],
-            'message'  => 'Có xung đột phiên bản. Đang tải lại ghi chú...'
+            'success'          => false,
+            'conflict'         => true,
+            'version'          => $serverVersion,
+            'latest_title'     => $note['title'] ?? '',
+            'latest_content'   => $note['content'] ?? '',
+            'message'          => 'Có xung đột phiên bản. Đang tải lại ghi chú...'
         ]);
 
         exit;
     }
-
-    // =========================================================
-    // UPDATE NOTE
-    // =========================================================
-    $new_version = $note['version'] + 1;
 
     $stmt = $pdo->prepare("
         UPDATE notes
         SET
             title = ?,
             content = ?,
-            version = ?,
+            version = version + 1,
             updated_at = NOW()
         WHERE id = ?
+          AND version = ?
     ");
 
     $stmt->execute([
         $title,
         $content,
-        $new_version,
-        $id
+        $id,
+        $serverVersion
     ]);
+
+    if ($stmt->rowCount() === 0) {
+
+        $stmtFresh = $pdo->prepare("
+            SELECT version, title, content
+            FROM notes
+            WHERE id = ?
+            LIMIT 1
+        ");
+        $stmtFresh->execute([$id]);
+        $fresh = $stmtFresh->fetch(PDO::FETCH_ASSOC) ?: [];
+
+        echo json_encode([
+            'success'          => false,
+            'conflict'         => true,
+            'version'          => (int) ($fresh['version'] ?? $serverVersion),
+            'latest_title'     => $fresh['title'] ?? '',
+            'latest_content'   => $fresh['content'] ?? '',
+            'message'          => 'Ghi chú đã được cập nhật bởi người khác. Đang đồng bộ...'
+        ]);
+
+        exit;
+    }
+
+    $new_version = $serverVersion + 1;
 
     broadcastNoteUpdate(
         $id,
@@ -189,8 +215,26 @@ function broadcastNoteUpdate(
     $version,
     $user_name
 ) {
+    global $pdo;
 
-    // WebSocket server sẽ xử lý ở đây
+    // Ratchet relays typing with DB version per message; verify row matches expected version after save.
+    if (!isset($pdo) || !($pdo instanceof \PDO)) {
+        return;
+    }
 
+    $id       = (int) $note_id;
+    $expected = (int) $version;
+
+    if ($id <= 0 || $expected < 1) {
+        return;
+    }
+
+    $stmt = $pdo->prepare('SELECT version FROM notes WHERE id = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $actual = (int) $stmt->fetchColumn();
+
+    if ($actual !== $expected) {
+        error_log("broadcastNoteUpdate: version mismatch note={$id} expected={$expected} db={$actual}");
+    }
 }
 ?>

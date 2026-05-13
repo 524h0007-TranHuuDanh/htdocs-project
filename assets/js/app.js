@@ -12,13 +12,72 @@ let currentNoteId       = null;
 let passwordModalInstance = null;
 let tempOpenData        = null;
 let autoRefreshInterval = null;
-let autoSaveTimer       = null;
-let isSaving            = false;
+let autoSaveTimer          = null;
+let autoSaveRetryTimer     = null;
+let autoSaveBusyTimer      = null;
+let autoSaveInFlightSeq    = 0;
+let lastAutoSavePersistSig = '';
+let isSaving               = false;
+/** Coalesces list refresh after rapid autosaves (single search request). */
+let liveSearchAfterSaveTimer = null;
+/** True while applying server title/content+version after HTTP conflict; blocks autosave to avoid stale POSTs. */
+let noteConflictResolutionLock = false;
+/** True while GET api/get_notes.php (note_id) is in flight for an opened note; blocks autosave until response. */
+let noteVersionLoadPending = false;
+let noteVersionFetchGen    = 0;
+
+/** Offline queue sync: avoids tight retry loops and exposes status to the UI layer. */
+let offlineSyncIsRunning = false;
+const OFFLINE_SYNC_BASE_DELAY_MS = 2000;
+const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 
 // Bootstrap modals (khởi tạo sau DOM ready)
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+
+function appendCsrfToken(formData) {
+    formData.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+}
+
+/** application/x-www-form-urlencoded bodies */
+function appendCsrfUrlEncoded(body) {
+    const raw = window.APP_CONFIG?.csrf_token || '';
+    const base = body == null ? '' : String(body);
+    const sep    = base.trim() !== '' ? '&' : '';
+    return `${base}${sep}csrf_token=${encodeURIComponent(raw)}`;
+}
+
+function getNoteContentVersion() {
+    const contentEl = document.getElementById('noteContent');
+    const raw = contentEl?.dataset.version;
+    if (raw === undefined || raw === '') return NaN;
+    const v = parseInt(raw, 10);
+    return Number.isFinite(v) ? v : NaN;
+}
+
+function buildWsNoteUpdatePayload() {
+    const titleEl = document.getElementById('noteTitle');
+    const contentEl = document.getElementById('noteContent');
+    const v = !noteVersionLoadPending ? getNoteContentVersion() : NaN;
+    const payload = {
+        type:      'update',
+        note_id:   currentNoteIdForWS,
+        title:     (titleEl && titleEl.value) || '',
+        content:   (contentEl && contentEl.value) || '',
+        user_name: currentUserName
+    };
+    if (Number.isFinite(v)) payload.version = v;
+    return payload;
+}
+
+function setNoteOwnerToolbarVisible(visible) {
+    const display = visible ? 'block' : 'none';
+    ['toolsSection', 'colorSection', 'shareManagerSection', 'btnTrashNote'].forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) node.style.display = display;
+    });
+}
 
 // ====================== DOM READY (một handler duy nhất) ======================
 document.addEventListener('DOMContentLoaded', () => {
@@ -65,14 +124,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (noteContentEl) {
         noteContentEl.addEventListener('blur', function () {
             if (wsReady && currentNoteIdForWS) {
-                _wsSend({
-                    type:      'update',
-                    note_id:   currentNoteIdForWS,
-                    title:     document.getElementById('noteTitle').value || '',
-                    content:   this.value || '',
-                    version:   parseInt(this.dataset.version) || 1,
-                    user_name: currentUserName
-                });
+                _wsSendEditorStateIfChanged();
             }
         });
     }
@@ -99,14 +151,7 @@ document.addEventListener('input', function (e) {
 
     clearTimeout(realtimeTypingTimer);
     realtimeTypingTimer = setTimeout(() => {
-        _wsSend({
-            type:      'update',
-            note_id:   currentNoteIdForWS,
-            title:     document.getElementById('noteTitle').value   || '',
-            content:   document.getElementById('noteContent').value || '',
-            version:   parseInt(document.getElementById('noteContent').dataset.version) || 1,
-            user_name: currentUserName
-        });
+        _wsSendEditorStateIfChanged();
     }, 80);
 });
 
@@ -182,6 +227,14 @@ async function liveSearch() {
     }, 300);
 }
 
+function scheduleLiveSearchAfterSave() {
+    clearTimeout(liveSearchAfterSaveTimer);
+    liveSearchAfterSaveTimer = setTimeout(() => {
+        liveSearchAfterSaveTimer = null;
+        liveSearch();
+    }, 500);
+}
+
 // ====================== RENDER NOTES ======================
 function renderNotes(notes) {
     const container = document.getElementById('notesContainer');
@@ -206,6 +259,15 @@ function renderNotes(notes) {
         if (n.is_locked == 1) icons += '<i class="bi bi-lock-fill text-warning me-1" title="Đã khóa"></i>';
         if (ownerName)         icons += '<i class="bi bi-people-fill text-info me-1" title="Được chia sẻ"></i>';
         if (n.is_pinned == 1)  icons += '<i class="bi bi-pin-fill text-danger me-1" title="Đã ghim"></i>';
+
+        let offlineSyncBadge = '';
+        if (n.syncStatus === 'error' || n.lastSyncError) {
+            offlineSyncBadge = `<span class="badge bg-danger ms-1" title="${escapeHtml(n.lastSyncError || 'Lỗi đồng bộ')}">Chưa đồng bộ</span>`;
+        } else if (n.syncStatus === 'pending' && n.nextRetryAt && n.nextRetryAt > Date.now()) {
+            offlineSyncBadge = '<span class="badge bg-secondary ms-1" title="Đang chờ thử lại">Chờ thử lại</span>';
+        } else if (n.syncStatus === 'pending' || isNoteTemp(n.id)) {
+            offlineSyncBadge = '<span class="badge bg-warning text-dark ms-1">Chờ đồng bộ</span>';
+        }
 
         const shareInfo = ownerName ? `
             <div class="position-absolute bottom-0 start-0 end-0 px-3 pb-2 d-flex justify-content-between align-items-center">
@@ -245,8 +307,8 @@ function renderNotes(notes) {
                      onclick="event.stopPropagation(); togglePin(${n.id}, ${n.is_pinned == 1 ? 0 : 1})">
                      <i class="bi ${pinClass} fs-5"></i></button>`
                 : ''}
-            <h5 class="card-title text-truncate d-flex align-items-center gap-1">
-                ${icons} ${escapeHtml(n.title) || 'Không tiêu đề'}
+            <h5 class="card-title text-truncate d-flex align-items-center gap-1 flex-wrap">
+                ${icons} ${escapeHtml(n.title) || 'Không tiêu đề'} ${offlineSyncBadge}
             </h5>
             <p class="card-text text-muted text-truncate"
                style="white-space:pre-wrap; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;">
@@ -289,6 +351,7 @@ function submitNotePassword() {
     const fd = new FormData();
     fd.append('note_id',  currentNoteId);
     fd.append('password', password);
+    appendCsrfToken(fd);
 
     fetch('api/verify_note.php', { method: 'POST', body: fd })
         .then(res => res.json())
@@ -319,12 +382,46 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     document.getElementById('noteTitle').value   = title;
     document.getElementById('noteContent').value = content;
 
-    const contentEl           = document.getElementById('noteContent');
-    contentEl.dataset.version = '1';
+    const contentEl = document.getElementById('noteContent');
+    delete contentEl.dataset.version;
 
     document.getElementById('imagePreviewContainer').innerHTML = '';
     document.getElementById('noteLabelsContainer').innerHTML   = '';
     document.getElementById('saveStatus').innerText            = '';
+    lastAutoSavePersistSig = '';
+    noteConflictResolutionLock = false;
+    clearTimeout(autoSaveTimer);
+    clearTimeout(autoSaveRetryTimer);
+    clearTimeout(autoSaveBusyTimer);
+    clearTimeout(liveSearchAfterSaveTimer);
+    clearTimeout(realtimeTypingTimer);
+    liveSearchAfterSaveTimer = null;
+    autoSaveTimer          = null;
+    autoSaveRetryTimer     = null;
+    autoSaveBusyTimer      = null;
+    realtimeTypingTimer    = null;
+    autoSaveInFlightSeq++;
+
+    if (id) {
+        noteVersionLoadPending = true;
+        const fetchGen = ++noteVersionFetchGen;
+        fetch(`api/get_notes.php?note_id=${id}`)
+            .then(r => r.json())
+            .then(note => {
+                if (note != null && note.version != null && note.version !== '') {
+                    contentEl.dataset.version = String(note.version);
+                }
+            })
+            .catch(() => {})
+            .finally(() => {
+                if (fetchGen === noteVersionFetchGen) {
+                    noteVersionLoadPending = false;
+                }
+            });
+    } else {
+        noteVersionFetchGen++;
+        noteVersionLoadPending = false;
+    }
 
     // --- Áp dụng màu ghi chú ---
     const modalWrapper  = document.getElementById('modalContentWrapper');
@@ -372,10 +469,7 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
         document.getElementById('noteContent').readOnly = false;
 
         if (id) {
-            document.getElementById('toolsSection').style.display        = 'block';
-            document.getElementById('colorSection').style.display        = 'block';
-            document.getElementById('shareManagerSection').style.display = 'block';
-            document.getElementById('btnTrashNote').style.display        = 'block';
+            setNoteOwnerToolbarVisible(true);
 
             fetch(`api/get_note_images.php?note_id=${id}`)
                 .then(r => r.json())
@@ -385,14 +479,6 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
             loadSharedUsers(id);
             if (wsBadge) wsBadge.style.display = 'inline-flex';
         }
-    }
-
-    // --- Lấy version mới nhất từ server ---
-    if (id) {
-        fetch(`api/get_notes.php?note_id=${id}`)
-            .then(r => r.json())
-            .then(note => { if (note && note.version) contentEl.dataset.version = note.version; })
-            .catch(() => {});
     }
 
     // --- Placeholder cho note mới ---
@@ -419,6 +505,8 @@ function startAutoRefresh() {
 
 function closeAndReload() {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    clearTimeout(liveSearchAfterSaveTimer);
+    liveSearchAfterSaveTimer = null;
     stopRealtime();
     noteModal.hide();
     liveSearch();
@@ -427,114 +515,198 @@ function closeAndReload() {
 // ====================== AUTO SAVE ======================
 // Tích hợp: offline fallback + WebSocket broadcast + xử lý conflict
 // =========================================================
+function _autoSavePayloadSignature() {
+    const noteId  = document.getElementById('noteId').value;
+    const title   = document.getElementById('noteTitle').value.trim();
+    const content = document.getElementById('noteContent').value;
+    return `${noteId}\x1e${title}\x1e${content}\x1e${getNoteContentVersion()}`;
+}
+
 function autoSave() {
     if (currentViewMode === 'trash' || currentPermission === 'read') return;
-    if (isSaving) return;
+    if (window.__remoteUpdating) return;
+    if (noteConflictResolutionLock) return;
 
     const noteId  = document.getElementById('noteId').value;
+    if (noteId && noteVersionLoadPending) return;
     const title   = document.getElementById('noteTitle').value.trim();
     const content = document.getElementById('noteContent').value;
 
     if (!noteId && !title && !content) return;
 
-    document.getElementById('saveStatus').innerHTML = '<i class="bi bi-hourglass-split"></i> Đang lưu...';
-
+    const hadPendingDebounce = !!autoSaveTimer;
     clearTimeout(autoSaveTimer);
+    clearTimeout(autoSaveRetryTimer);
+    clearTimeout(autoSaveBusyTimer);
+    autoSaveRetryTimer = null;
+    autoSaveBusyTimer  = null;
+
+    if (!hadPendingDebounce) {
+        document.getElementById('saveStatus').innerHTML = '<i class="bi bi-hourglass-split"></i> Đang lưu...';
+    }
+
     autoSaveTimer = setTimeout(() => {
+        autoSaveTimer = null;
 
-        // --- OFFLINE: lưu cục bộ ngay lập tức ---
-        if (!navigator.onLine) {
-            const noteData = {
-                id:         noteId || 'temp_' + Date.now(),
-                title,
-                content,
-                version:    parseInt(document.getElementById('noteContent').dataset.version) || 1,
-                updated_at: new Date().toISOString()
-            };
-            saveNoteOffline(noteData);
-            document.getElementById('saveStatus').innerHTML =
-                '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Đã lưu offline</span>';
-            showToast('Không có mạng. Ghi chú đã lưu cục bộ.', 'warning');
-            return;
-        }
+        const runCommitted = () => {
+            if (isSaving) {
+                clearTimeout(autoSaveBusyTimer);
+                autoSaveBusyTimer = setTimeout(runCommitted, 150);
+                return;
+            }
+            autoSaveBusyTimer = null;
 
-        // --- ONLINE: gửi lên server ---
-        isSaving = true;
-        const fd = new FormData();
-        fd.append('id',         noteId);
-        fd.append('title',      title);
-        fd.append('content',    content);
-        fd.append('version',    document.getElementById('noteContent').dataset.version || 1);
-        fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+            const nid  = document.getElementById('noteId').value;
+            const tit  = document.getElementById('noteTitle').value.trim();
+            const cont = document.getElementById('noteContent').value;
 
-        fetch('api/save_note.php', { method: 'POST', body: fd })
-            .then(res => res.json())
-            .then(d => {
-                isSaving = false;
-                const statusEl  = document.getElementById('saveStatus');
-                const contentEl = document.getElementById('noteContent');
+            if (!nid && !tit && !cont) {
+                document.getElementById('saveStatus').innerText = '';
+                return;
+            }
 
-                // -----------------------------------------------
-                // FIX: Xử lý conflict phiên bản
-                // Server trả về conflict=true khi client quá cũ.
-                // Cập nhật version + nội dung mới nhất, rồi tự
-                // retry sau 1 giây để lưu lại.
-                // -----------------------------------------------
-                if (!d.success && d.conflict) {
-                    contentEl.dataset.version = d.version;
+            if (nid && noteVersionLoadPending) return;
 
-                    // Chỉ cập nhật nội dung nếu user KHÔNG đang gõ
-                    if (document.activeElement !== contentEl && d.latest_content !== undefined) {
-                        contentEl.value = d.latest_content;
-                    }
-                    if (document.activeElement !== document.getElementById('noteTitle') && d.latest_title !== undefined) {
-                        document.getElementById('noteTitle').value = d.latest_title;
-                    }
+            if (nid && _autoSavePayloadSignature() === lastAutoSavePersistSig) {
+                const statusEl = document.getElementById('saveStatus');
+                statusEl.innerHTML = lastAutoSavePersistSig
+                    ? '<i class="bi bi-check-circle-fill text-success"></i> Đã lưu'
+                    : '';
+                return;
+            }
 
-                    statusEl.innerHTML = '<i class="bi bi-arrow-clockwise text-warning"></i> Đồng bộ xong';
-                    showToast('Đã cập nhật phiên bản mới nhất, đang lưu lại...', 'warning');
-
-                    // Retry sau 1 giây với version mới
-                    setTimeout(autoSave, 1000);
-                    return;
-                }
-
-                if (d.success) {
-                    statusEl.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> Đã lưu';
-
-                    if (!noteId && d.note_id) {
-                        document.getElementById('noteId').value = d.note_id;
-                        currentNoteId = d.note_id;
-                        document.getElementById('toolsSection').style.display        = 'block';
-                        document.getElementById('colorSection').style.display        = 'block';
-                        document.getElementById('shareManagerSection').style.display = 'block';
-                        document.getElementById('btnTrashNote').style.display        = 'block';
-                    }
-
-                    if (d.version) {
-                        contentEl.dataset.version = d.version;
-                    }
-
-                    liveSearch();
-                } else {
-                    statusEl.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> Lỗi lưu';
-                    if (d.message) showToast(d.message, 'danger');
-                }
-            })
-            .catch(() => {
-                isSaving = false;
-                document.getElementById('saveStatus').innerHTML =
-                    '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
+            // --- OFFLINE: lưu cục bộ ngay lập tức ---
+            if (!navigator.onLine) {
+                const vOff = getNoteContentVersion();
                 const noteData = {
-                    id:         noteId || 'temp_' + Date.now(),
-                    title,
-                    content,
-                    version:    parseInt(document.getElementById('noteContent').dataset.version) || 1,
+                    id:         nid || 'temp_' + Date.now(),
+                    title:      tit,
+                    content:    cont,
+                    version:    Number.isFinite(vOff) ? vOff : 1,
                     updated_at: new Date().toISOString()
                 };
                 saveNoteOffline(noteData);
-                showToast('Không kết nối mạng. Ghi chú đã được lưu cục bộ.', 'warning');
-            });
+                document.getElementById('saveStatus').innerHTML =
+                    '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Đã lưu offline</span>';
+                showToast('Không có mạng. Ghi chú đã lưu cục bộ.', 'warning');
+                return;
+            }
+
+            // --- ONLINE: gửi lên server ---
+            const verNum = getNoteContentVersion();
+            if (nid && !Number.isFinite(verNum)) {
+                document.getElementById('saveStatus').innerText = '';
+                return;
+            }
+
+            isSaving = true;
+            const mySeq = ++autoSaveInFlightSeq;
+
+            const fd = new FormData();
+            fd.append('id',      nid);
+            fd.append('title',   tit);
+            fd.append('content', cont);
+            fd.append('version', nid ? String(verNum) : '1');
+            appendCsrfToken(fd);
+
+            fetch('api/save_note.php', { method: 'POST', body: fd })
+                .then(res => res.json())
+                .then(d => {
+                    if (mySeq !== autoSaveInFlightSeq) return;
+
+                    const statusEl  = document.getElementById('saveStatus');
+                    const contentEl = document.getElementById('noteContent');
+
+                    if (!d.success && d.conflict) {
+                        clearTimeout(autoSaveRetryTimer);
+                        autoSaveRetryTimer = null;
+
+                        const titleEl = document.getElementById('noteTitle');
+                        const hasLatestTitle   = d.latest_title !== undefined;
+                        const hasLatestContent = d.latest_content !== undefined;
+
+                        noteConflictResolutionLock = true;
+                        window.__remoteUpdating = true;
+                        try {
+                            // Apply server fields first; only then bump version (never version without synced title+body).
+                            if (hasLatestTitle) {
+                                titleEl.value = d.latest_title;
+                            }
+                            if (hasLatestContent) {
+                                contentEl.value = d.latest_content;
+                            }
+                            if (hasLatestTitle && hasLatestContent &&
+                                d.version !== undefined && d.version !== null && d.version !== '') {
+                                contentEl.dataset.version = String(d.version);
+                            }
+                            lastAutoSavePersistSig = _autoSavePayloadSignature();
+                        } finally {
+                            window.__remoteUpdating = false;
+                            noteConflictResolutionLock = false;
+                        }
+
+                        statusEl.innerHTML = '<i class="bi bi-arrow-clockwise text-warning"></i> Đồng bộ từ máy chủ';
+                        showToast(
+                            'Nội dung đã được đồng bộ với bản mới nhất trên máy chủ. Tiếp tục chỉnh sửa để lưu.',
+                            'warning'
+                        );
+                        return;
+                    }
+
+                    if (d.success) {
+                        statusEl.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> Đã lưu';
+
+                        if (!nid && d.note_id) {
+                            document.getElementById('noteId').value = d.note_id;
+                            currentNoteId = d.note_id;
+                            setNoteOwnerToolbarVisible(true);
+                        }
+
+                        if (d.version) {
+                            contentEl.dataset.version = d.version;
+                        }
+
+                        lastAutoSavePersistSig = _autoSavePayloadSignature();
+                        scheduleLiveSearchAfterSave();
+                    } else {
+                        statusEl.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> Lỗi lưu';
+                        if (d.message) showToast(d.message, 'danger');
+                    }
+                })
+                .catch(() => {
+                    if (mySeq !== autoSaveInFlightSeq) return;
+
+                    document.getElementById('saveStatus').innerHTML =
+                        '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
+                    const noteData = {
+                        id:         nid || 'temp_' + Date.now(),
+                        title:      tit,
+                        content:    cont,
+                        version:    Number.isFinite(getNoteContentVersion()) ? getNoteContentVersion() : 1,
+                        updated_at: new Date().toISOString()
+                    };
+                    saveNoteOffline(noteData);
+                    showToast('Không kết nối mạng. Ghi chú đã được lưu cục bộ.', 'warning');
+                })
+                .finally(() => {
+                    if (mySeq === autoSaveInFlightSeq) {
+                        isSaving = false;
+                    }
+                    if (mySeq !== autoSaveInFlightSeq) return;
+                    setTimeout(() => {
+                        if (isSaving || autoSaveTimer) return;
+                        if (currentViewMode === 'trash' || currentPermission === 'read') return;
+                        if (noteVersionLoadPending) return;
+                        if (noteConflictResolutionLock) return;
+                        if (!navigator.onLine) return;
+                        if (_autoSavePayloadSignature() !== lastAutoSavePersistSig) {
+                            autoSave();
+                        }
+                    }, 0);
+                });
+        };
+
+        runCommitted();
     }, 800);
 }
 
@@ -551,7 +723,7 @@ function shareNote() {
     fd.append('note_id',    noteId);
     fd.append('permission', perm);
     fd.append('share_with', input);
-    fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+    appendCsrfToken(fd);
 
     fetch('api/share_note.php', { method: 'POST', body: fd })
         .then(r => r.json())
@@ -587,6 +759,7 @@ function revokeShare(shareId) {
     showConfirm('Thu hồi quyền chia sẻ này?', () => {
         const fd = new FormData();
         fd.append('share_id', shareId);
+        appendCsrfToken(fd);
         fetch('api/revoke_share.php', { method: 'POST', body: fd })
             .then(r => r.json())
             .then(data => {
@@ -625,7 +798,7 @@ function _showLockSetModal(id) {
             fd.append('action',           'lock');
             fd.append('password',         pw);
             fd.append('confirm_password', pw2);
-            fd.append('csrf_token',       window.APP_CONFIG?.csrf_token || '');
+            appendCsrfToken(fd);
 
             return fetch('api/lock_note.php', { method: 'POST', body: fd })
                 .then(r => r.json())
@@ -660,7 +833,7 @@ function _showLockActionPicker(id) {
             const fd = new FormData();
             fd.append('note_id',      id);
             fd.append('old_password', oldPw);
-            fd.append('csrf_token',   window.APP_CONFIG?.csrf_token || '');
+            appendCsrfToken(fd);
 
             if (actionValue === 'unlock') {
                 fd.append('action', 'unlock');
@@ -709,7 +882,7 @@ function _showChangePasswordModal(id, oldPw) {
             fd.append('old_password',     oldPw);
             fd.append('password',         pw);
             fd.append('confirm_password', pw2);
-            fd.append('csrf_token',       window.APP_CONFIG?.csrf_token || '');
+            appendCsrfToken(fd);
 
             return fetch('api/lock_note.php', { method: 'POST', body: fd })
                 .then(r => r.json())
@@ -763,8 +936,7 @@ function _openPasswordModal(config) {
 
     document.getElementById('passwordModal').addEventListener('shown.bs.modal', function onShown() {
         document.getElementById(config.fields[0].id)?.focus();
-        this.removeEventListener('shown.bs.modal', onShown);
-    });
+    }, { once: true });
 
     passwordModalInstance.show();
 }
@@ -800,7 +972,7 @@ function _doDeleteNote(id, action) {
     const fd = new FormData();
     fd.append('id',         id);
     fd.append('action',     action);
-    fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+    appendCsrfToken(fd);
 
     fetch('api/delete_note.php', { method: 'POST', body: fd })
         .then(res => res.json())
@@ -846,7 +1018,7 @@ function _deleteNoteWithPassword(id, action) {
         fd.append('id',              id);
         fd.append('action',          action);
         fd.append('delete_password', pw);
-        fd.append('csrf_token',      window.APP_CONFIG?.csrf_token || '');
+        appendCsrfToken(fd);
 
         fetch('api/delete_note.php', { method: 'POST', body: fd })
             .then(res => res.json())
@@ -880,106 +1052,212 @@ function restoreNote() {
     const id = document.getElementById('noteId').value;
     const fd = new FormData();
     fd.append('id', id);
+    appendCsrfToken(fd);
     fetch('api/restore_note.php', { method: 'POST', body: fd })
         .then(() => { showAlert('Khôi phục thành công!', 'success'); closeAndReload(); });
 }
 
 // ====================== WEBSOCKET REALTIME ======================
-let ws                 = null;
-let wsReconnectTimer   = null;
-let wsReady            = false;
-let currentNoteIdForWS = null;
-let _pollInterval      = null;
+let ws                    = null;
+let wsReconnectTimer      = null;
+let wsAwaitCloseReconnect = false;
+let wsReady               = false;
+let currentNoteIdForWS    = null;
+let _pollInterval         = null;
+let _lastWsOutboundSig    = '';
+let _lastWsInboundKey     = '';
 
 const WS_HOST = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':8080';
 
 function connectWebSocket() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    try {
-        ws = new WebSocket(WS_HOST);
-    } catch (e) {
-        console.warn('WebSocket không khả dụng, dùng fallback polling.');
+    if (ws) {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+            return;
+        }
+        if (ws.readyState === WebSocket.CLOSING) {
+            if (!wsAwaitCloseReconnect) {
+                wsAwaitCloseReconnect = true;
+                ws.onopen    = null;
+                ws.onmessage = null;
+                ws.onclose   = null;
+                ws.onerror   = null;
+                ws.addEventListener('close', () => {
+                    wsAwaitCloseReconnect = false;
+                    ws = null;
+                    connectWebSocket();
+                }, { once: true });
+            }
+            return;
+        }
+        ws = null;
+    }
+
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+
+    if (!currentUserId) {
+        console.warn('WebSocket: chưa đăng nhập, dùng fallback polling.');
         _startFallbackPolling();
         return;
     }
 
-    ws.onopen = () => {
-        clearTimeout(wsReconnectTimer);
-        ws.send(JSON.stringify({ type: 'auth', user_id: currentUserId, user_name: currentUserName }));
-        _setWsStatus('connecting');
-    };
-
-    ws.onmessage = (event) => {
-        try {
-            const data = JSON.parse(event.data);
-
-            if (data.type === 'auth_success') {
-                wsReady = true;
-                _setWsStatus('online');
-                if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+    fetch('api/ws_token.php', { credentials: 'same-origin' })
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((d) => {
+            if (!d.success || !d.token) return Promise.reject(new Error('ws_token'));
+            return d.token;
+        })
+        .then((token) => {
+            let socket;
+            try {
+                ws = new WebSocket(WS_HOST);
+                socket = ws;
+            } catch (e) {
+                console.warn('WebSocket không khả dụng, dùng fallback polling.');
+                _startFallbackPolling();
+                return;
             }
 
-            if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-                const titleEl   = document.getElementById('noteTitle');
-                const contentEl = document.getElementById('noteContent');
+            socket.onopen = () => {
+                if (ws !== socket) return;
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = null;
+                _stopFallbackPolling();
+                socket.send(JSON.stringify({ type: 'auth', token }));
+                _setWsStatus('connecting');
+            };
 
-                const isEditingTitle   = document.activeElement === titleEl;
-                const isEditingContent = document.activeElement === contentEl;
+            socket.onmessage = (event) => {
+                if (ws !== socket) return;
+                try {
+                    const data = JSON.parse(event.data);
 
-                // FIX: cập nhật version ngay khi nhận WS update
-                // (cả từ typing broadcast lẫn from_save)
-                if (data.version) {
-                    contentEl.dataset.version = data.version;
-                }
-
-                if (data.title !== undefined && !isEditingTitle) {
-                    titleEl.value = data.title;
-                }
-
-                if (data.content !== undefined) {
-                    const currentContent  = contentEl.value    || '';
-                    const incomingContent = String(data.content);
-
-                    if (!isEditingContent) {
-                        window.__remoteUpdating = true;
-                        contentEl.value         = incomingContent;
-                        window.__remoteUpdating = false;
-                    } else {
-                        const isDeleting   = incomingContent.length < currentContent.length;
-                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                        if (isDeleting || tooDifferent) {
-                            const cursorPos         = contentEl.selectionStart;
-                            window.__remoteUpdating = true;
-                            contentEl.value         = incomingContent;
-                            window.__remoteUpdating = false;
-                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e) {}
-                        }
+                    if (data.type === 'auth_error') {
+                        wsReady = false;
+                        _setWsStatus('offline');
+                        try { socket.close(); } catch (e2) {}
+                        return;
                     }
+
+                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+                        console.warn('[WS] join_denied:', data.message || '');
+                        return;
+                    }
+
+                    if (data.type === 'auth_success') {
+                        wsReady = true;
+                        _setWsStatus('online');
+                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+                    }
+
+                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+                        if (data.user_name === currentUserName) return;
+
+                        const contentElPre = document.getElementById('noteContent');
+                        const incomingVer = data.version != null && data.version !== ''
+                            ? parseInt(data.version, 10)
+                            : NaN;
+                        const rawLocal = contentElPre && contentElPre.dataset.version;
+                        const localVer = rawLocal !== undefined && rawLocal !== ''
+                            ? parseInt(rawLocal, 10)
+                            : NaN;
+                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                            return;
+                        }
+
+                        const c = String(data.content ?? '');
+                        const inboundKey = [
+                            data.note_id,
+                            data.user_name,
+                            data.timestamp ?? '',
+                            data.title ?? '',
+                            c.length,
+                            c.slice(0, 256)
+                        ].join('\x1e');
+                        if (inboundKey === _lastWsInboundKey) return;
+                        _lastWsInboundKey = inboundKey;
+
+                        const titleEl   = document.getElementById('noteTitle');
+                        const contentEl = document.getElementById('noteContent');
+
+                        const isEditingTitle   = document.activeElement === titleEl;
+                        const isEditingContent = document.activeElement === contentEl;
+
+                        window.__remoteUpdating = true;
+                        try {
+                            if (data.version != null && data.version !== '') {
+                                contentEl.dataset.version = String(data.version);
+                            }
+
+                            if (data.title !== undefined && !isEditingTitle) {
+                                titleEl.value = data.title;
+                            }
+
+                            if (data.content !== undefined) {
+                                const currentContent  = contentEl.value    || '';
+                                const incomingContent = String(data.content);
+
+                                if (!isEditingContent) {
+                                    contentEl.value = incomingContent;
+                                } else {
+                                    const isDeleting   = incomingContent.length < currentContent.length;
+                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                                    if (isDeleting || tooDifferent) {
+                                        const cursorPos = contentEl.selectionStart;
+                                        contentEl.value = incomingContent;
+                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                                    }
+                                }
+                            }
+                        } finally {
+                            window.__remoteUpdating = false;
+                        }
+
+                        _showTypingIndicator(data.user_name);
+                    }
+
+                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+                        _renderPresence(data.users);
+                    }
+                } catch (e) {
+                    console.error('WS parse error:', e);
                 }
+            };
 
-                _showTypingIndicator(data.user_name);
-            }
+            socket.onclose = () => {
+                if (ws !== socket) return;
+                wsReady = false;
+                _setWsStatus('offline');
+                ws = null;
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = setTimeout(() => {
+                    wsReconnectTimer = null;
+                    connectWebSocket();
+                }, 3000);
+            };
 
-            if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-                _renderPresence(data.users);
-            }
-        } catch (e) {
-            console.error('WS parse error:', e);
-        }
-    };
-
-    ws.onclose = () => {
-        wsReady          = false;
-        _setWsStatus('offline');
-        wsReconnectTimer = setTimeout(connectWebSocket, 3000);
-    };
-
-    ws.onerror = () => { _setWsStatus('offline'); };
+            socket.onerror = () => {
+                if (ws !== socket) return;
+                _setWsStatus('offline');
+            };
+        })
+        .catch(() => {
+            console.warn('WebSocket không lấy được token, dùng fallback polling.');
+            _startFallbackPolling();
+        });
 }
 
 function _wsSend(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function _wsSendEditorStateIfChanged() {
+    const payload = buildWsNoteUpdatePayload();
+    const sig = `${payload.note_id}\x1e${payload.title}\x1e${payload.content}\x1e${payload.version}`;
+    if (sig === _lastWsOutboundSig) return;
+    _lastWsOutboundSig = sig;
+    _wsSend(payload);
 }
 
 function _startFallbackPolling() {
@@ -993,9 +1271,14 @@ function _startFallbackPolling() {
                 if (!note) return;
                 const titleEl   = document.getElementById('noteTitle');
                 const contentEl = document.getElementById('noteContent');
-                if (document.activeElement !== titleEl)   titleEl.value   = note.title   ?? '';
-                if (document.activeElement !== contentEl) contentEl.value = note.content ?? '';
-                if (note.version) contentEl.dataset.version = note.version;
+                window.__remoteUpdating = true;
+                try {
+                    if (document.activeElement !== titleEl)   titleEl.value   = note.title   ?? '';
+                    if (document.activeElement !== contentEl) contentEl.value = note.content ?? '';
+                    if (note.version) contentEl.dataset.version = note.version;
+                } finally {
+                    window.__remoteUpdating = false;
+                }
             })
             .catch(() => {});
     }, 4000);
@@ -1038,14 +1321,25 @@ function _showTypingIndicator(userName) {
 
 function startRealtimeForNote(noteId, permission) {
     if (permission !== 'edit' && permission !== 'owner') return;
+    if (currentNoteIdForWS !== noteId) {
+        if (currentNoteIdForWS && wsReady) {
+            _wsSend({ type: 'leave_note', note_id: currentNoteIdForWS });
+        }
+        _lastWsOutboundSig = '';
+        _lastWsInboundKey  = '';
+    }
     currentNoteIdForWS = noteId;
     connectWebSocket();
     if (wsReady) _wsSend({ type: 'join_note', note_id: noteId });
 }
 
 function stopRealtime() {
+    clearTimeout(realtimeTypingTimer);
+    realtimeTypingTimer = null;
     if (currentNoteIdForWS) _wsSend({ type: 'leave_note', note_id: currentNoteIdForWS });
     currentNoteIdForWS = null;
+    _lastWsOutboundSig = '';
+    _lastWsInboundKey  = '';
     _stopFallbackPolling();
     const p = document.getElementById('wsPresenceBar');
     const t = document.getElementById('wsTypingIndicator');
@@ -1062,6 +1356,7 @@ function uploadImage() {
     const fd = new FormData();
     fd.append('image',   f);
     fd.append('note_id', nid);
+    appendCsrfToken(fd);
 
     fetch('api/upload_image.php', { method: 'POST', body: fd })
         .then(r => r.json())
@@ -1131,7 +1426,7 @@ function addNewLabel() {
     fetch('api/manage_labels.php?action=add', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `name=${encodeURIComponent(name)}`
+        body:    appendCsrfUrlEncoded(`name=${encodeURIComponent(name)}`)
     }).then(() => { document.getElementById('newLabelName').value = ''; loadFilterLabels(); });
 }
 
@@ -1141,7 +1436,7 @@ function renameLabel(id, currentName) {
     fetch('api/manage_labels.php?action=rename', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `id=${id}&name=${encodeURIComponent(newName.trim())}`
+        body:    appendCsrfUrlEncoded(`id=${id}&name=${encodeURIComponent(newName.trim())}`)
     }).then(() => loadFilterLabels(() => liveSearch()));
 }
 
@@ -1150,7 +1445,7 @@ function deleteLabel(id) {
         fetch('api/manage_labels.php?action=delete', {
             method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body:    `id=${id}`
+            body:    appendCsrfUrlEncoded(`id=${id}`)
         }).then(() => {
             if (currentLabelId == id) currentLabelId = null;
             loadFilterLabels(() => liveSearch());
@@ -1187,7 +1482,7 @@ function addLabelToNote() {
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `note_id=${nid}&label_id=${lid}&action=add`
+        body:    appendCsrfUrlEncoded(`note_id=${nid}&label_id=${lid}&action=add`)
     }).then(() => {
         loadLabelsForNote(nid);
         liveSearch();
@@ -1199,7 +1494,7 @@ function removeLabel(nid, lid) {
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `note_id=${nid}&label_id=${lid}&action=remove`
+        body:    appendCsrfUrlEncoded(`note_id=${nid}&label_id=${lid}&action=remove`)
     }).then(() => { loadLabelsForNote(nid); liveSearch(); });
 }
 
@@ -1217,7 +1512,7 @@ function saveProfile() {
     fd.append('font_size',   fontSize);
     fd.append('theme_color', theme);
     fd.append('note_color',  noteColor);
-    fd.append('csrf_token',  window.APP_CONFIG?.csrf_token || '');
+    appendCsrfToken(fd);
 
     applyTheme(theme);
     document.documentElement.style.fontSize = fontSize;
@@ -1262,11 +1557,12 @@ function setView(v) {
 }
 
 function togglePin(id, state) {
-    fetch('api/pin_note.php', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `id=${id}&is_pinned=${state}`
-    }).then(() => liveSearch());
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('is_pinned', state);
+    appendCsrfToken(fd);
+    fetch('api/pin_note.php', { method: 'POST', body: fd })
+        .then(() => liveSearch());
 }
 
 function changeColor(color) {
@@ -1276,7 +1572,7 @@ function changeColor(color) {
     const fd = new FormData();
     fd.append('id',         id);
     fd.append('color',      color || '');
-    fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+    appendCsrfToken(fd);
 
     fetch('api/change_color.php', { method: 'POST', body: fd })
         .then(res => res.json())
@@ -1394,6 +1690,10 @@ function initIndexedDB() {
     request.onsuccess = function (event) {
         db = event.target.result;
         console.log('[IndexedDB] Initialized v3');
+        scheduleOfflineSyncStateEvent();
+        if (navigator.onLine) {
+            setTimeout(syncOfflineNotes, 2000);
+        }
     };
 
     request.onerror = function (event) {
@@ -1409,13 +1709,100 @@ function saveNoteOffline(note) {
     if (!db) return;
     const noteToSave = {
         ...note,
-        isTemp:     isNoteTemp(note.id),
-        syncStatus: 'pending',
-        updated_at: new Date().toISOString()
+        isTemp:        isNoteTemp(note.id),
+        syncStatus:    'pending',
+        updated_at:    new Date().toISOString(),
+        retryCount:    0,
+        nextRetryAt:   undefined,
+        lastSyncError: undefined
     };
     const tx = db.transaction(['notes'], 'readwrite');
     tx.objectStore('notes').put(noteToSave);
     console.log(`[Offline] Saved note ${note.id}`);
+    scheduleOfflineSyncStateEvent();
+}
+
+function putOfflineNote(note) {
+    if (!db) return;
+    const tx = db.transaction(['notes'], 'readwrite');
+    tx.objectStore('notes').put(note);
+}
+
+async function bumpOfflineRetry(note, message) {
+    const retry = (note.retryCount || 0) + 1;
+    const exp   = Math.min(6, Math.max(0, retry - 1));
+    const delay = Math.min(OFFLINE_SYNC_MAX_DELAY_MS, OFFLINE_SYNC_BASE_DELAY_MS * Math.pow(2, exp));
+    putOfflineNote({
+        ...note,
+        syncStatus:    'error',
+        retryCount:    retry,
+        nextRetryAt:   Date.now() + delay,
+        lastSyncError: typeof message === 'string' ? message : 'Lỗi đồng bộ'
+    });
+    scheduleOfflineSyncRetrySweep();
+}
+
+let offlineSyncSweepTimer = null;
+
+function scheduleOfflineSyncRetrySweep() {
+    clearTimeout(offlineSyncSweepTimer);
+    offlineSyncSweepTimer = null;
+    if (!navigator.onLine || !db) return;
+    setTimeout(() => {
+        getAllOfflineNotes().then((notes) => {
+            const now = Date.now();
+            let minWait = null;
+            for (const n of notes) {
+                if (n.nextRetryAt && n.nextRetryAt > now) {
+                    const w = n.nextRetryAt - now + 300;
+                    if (minWait === null || w < minWait) minWait = w;
+                }
+            }
+            if (minWait == null) return;
+            offlineSyncSweepTimer = setTimeout(() => {
+                offlineSyncSweepTimer = null;
+                if (navigator.onLine) syncOfflineNotes();
+            }, minWait);
+        });
+    }, 0);
+}
+
+function scheduleOfflineSyncStateEvent() {
+    if (typeof queueMicrotask === 'function') {
+        queueMicrotask(() => { emitOfflineSyncStateEvent(); });
+    } else {
+        setTimeout(() => { emitOfflineSyncStateEvent(); }, 0);
+    }
+}
+
+async function getOfflineSyncSummary() {
+    const notes = await getAllOfflineNotes();
+    const now   = Date.now();
+    let errorCount = 0;
+    let backoffCount = 0;
+    for (const n of notes) {
+        if (n.syncStatus === 'error') errorCount++;
+        if (n.nextRetryAt && n.nextRetryAt > now) backoffCount++;
+    }
+    return {
+        total:          notes.length,
+        errorCount,
+        backoffCount,
+        readyCount:     Math.max(0, notes.length - backoffCount),
+        syncing:        offlineSyncIsRunning
+    };
+}
+
+function emitOfflineSyncStateEvent() {
+    getOfflineSyncSummary().then((detail) => {
+        try {
+            window.dispatchEvent(new CustomEvent('noteapp:offline-sync', { detail }));
+        } catch (e) { /* ignore */ }
+    });
+}
+
+if (typeof window !== 'undefined') {
+    window.getNoteAppOfflineSyncSummary = getOfflineSyncSummary;
 }
 
 async function getAllOfflineNotes() {
@@ -1434,35 +1821,112 @@ async function syncOfflineNotes() {
 
     const offlineNotes = await getAllOfflineNotes();
     if (offlineNotes.length === 0) return;
-    console.log(`[Offline Sync] Found ${offlineNotes.length} notes`);
 
-    let syncedCount = 0;
-    for (const note of offlineNotes) {
-        try {
-            const fd = new FormData();
-            fd.append('id',         isNoteTemp(note.id) ? 0 : note.id);
-            fd.append('title',      note.title   || '');
-            fd.append('content',    note.content || '');
-            fd.append('version',    note.version || 1);
-            fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+    const now        = Date.now();
+    const toProcess  = offlineNotes.filter((n) => !n.nextRetryAt || n.nextRetryAt <= now);
+    if (toProcess.length === 0) {
+        scheduleOfflineSyncStateEvent();
+        scheduleOfflineSyncRetrySweep();
+        return;
+    }
 
-            const res  = await fetch('api/save_note.php', { method: 'POST', body: fd });
-            const data = await res.json();
+    console.log(`[Offline Sync] Found ${offlineNotes.length} notes (${toProcess.length} due now)`);
+    offlineSyncIsRunning = true;
+    emitOfflineSyncStateEvent();
 
-            if (data.success) {
-                syncedCount++;
-                const delTx = db.transaction(['notes'], 'readwrite');
-                delTx.objectStore('notes').delete(note.id);
-                console.log(`[Offline] Synced ${note.id} → ${data.note_id}`);
+    let syncedCount              = 0;
+    let conflictStillPending    = 0;
+
+    for (const note of toProcess) {
+        let work               = { ...note };
+        let unresolvedConflict = false;
+
+        for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+                const fd = new FormData();
+                fd.append('id',         isNoteTemp(work.id) ? 0 : work.id);
+                fd.append('title',      work.title   || '');
+                fd.append('content',    work.content || '');
+                fd.append('version',    String(work.version != null && work.version !== '' ? work.version : 1));
+                appendCsrfToken(fd);
+
+                const res = await fetch('api/save_note.php', { method: 'POST', body: fd });
+
+                let data;
+                try {
+                    data = await res.json();
+                } catch (parseErr) {
+                    console.error('Sync failed for note', work.id, parseErr);
+                    unresolvedConflict = false;
+                    await bumpOfflineRetry(work, 'Phản hồi máy chủ không hợp lệ');
+                    break;
+                }
+
+                if (!res.ok) {
+                    unresolvedConflict = false;
+                    await bumpOfflineRetry(work, `Lỗi HTTP ${res.status}`);
+                    break;
+                }
+
+                if (data.success) {
+                    unresolvedConflict = false;
+                    syncedCount++;
+                    const delTx = db.transaction(['notes'], 'readwrite');
+                    delTx.objectStore('notes').delete(work.id);
+                    console.log(`[Offline] Synced ${work.id} → ${data.note_id}`);
+                    break;
+                }
+
+                if (data.conflict) {
+                    unresolvedConflict = true;
+                    const serverVer = parseInt(data.version, 10);
+                    work = {
+                        ...work,
+                        title:         work.title,
+                        content:       work.content,
+                        version:       Number.isFinite(serverVer) ? serverVer : (work.version || 1),
+                        syncStatus:    'pending',
+                        retryCount:    0,
+                        nextRetryAt:   undefined,
+                        lastSyncError: undefined,
+                        updated_at:    work.updated_at
+                    };
+                    putOfflineNote(work);
+                    continue;
+                }
+
+                unresolvedConflict = false;
+                await bumpOfflineRetry(work, data.message || 'Đồng bộ thất bại');
+                break;
+            } catch (err) {
+                console.error('Sync failed for note', work.id, err);
+                unresolvedConflict = false;
+                await bumpOfflineRetry(work, (err && err.message) || 'Lỗi mạng');
+                break;
             }
-        } catch (err) {
-            console.error('Sync failed for note', note.id, err);
+        }
+
+        if (unresolvedConflict) {
+            conflictStillPending++;
+            await bumpOfflineRetry(work, 'Xung đột phiên bản lặp lại; giữ bản cục bộ và chờ thử lại');
         }
     }
+
+    offlineSyncIsRunning = false;
+    emitOfflineSyncStateEvent();
+    scheduleOfflineSyncRetrySweep();
 
     if (syncedCount > 0) {
         showToast(`Đã đồng bộ ${syncedCount} ghi chú từ chế độ offline`, 'success');
         setTimeout(liveSearch, 800);
+    }
+    if (conflictStillPending > 0) {
+        showToast(
+            conflictStillPending === 1
+                ? 'Một ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.'
+                : `${conflictStillPending} ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.`,
+            'warning'
+        );
     }
 }
 

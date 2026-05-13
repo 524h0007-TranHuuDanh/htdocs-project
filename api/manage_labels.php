@@ -8,6 +8,13 @@ $action = $_REQUEST['action'] ?? 'list';
 
 header('Content-Type: application/json');
 
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST'
+    && in_array($action, ['add', 'rename', 'delete'], true)
+) {
+    require_valid_csrf_post();
+}
+
 try {
     if ($action == 'list') {
         $stmt = $pdo->prepare("SELECT * FROM labels WHERE user_id = ? ORDER BY name");

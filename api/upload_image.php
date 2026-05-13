@@ -12,6 +12,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_FILES['image']) || !isset(
     exit;
 }
 
+require_valid_csrf_post();
+
 $note_id = intval($_POST['note_id']);
 $user_id = $_SESSION['user_id'];
 $file    = $_FILES['image'];

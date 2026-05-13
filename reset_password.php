@@ -33,8 +33,9 @@ if (!empty($token)) {
 
 // Xử lý POST
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // CSRF Protection
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token'] ?? '') {
+    $sessTok = $_SESSION['csrf_token'] ?? null;
+    $postTok = $_POST['csrf_token'] ?? null;
+    if (!is_string($sessTok) || $sessTok === '' || !is_string($postTok) || !hash_equals($sessTok, $postTok)) {
         $message = "<div class='alert alert-danger'>Yêu cầu không hợp lệ (CSRF)!</div>";
     } else {
         $action = $_POST['action'] ?? '';
@@ -108,12 +109,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute([$user_id]);
                 $user = $stmt->fetch();
 
-                $is_valid = $token_verified || 
-                    (
-                        $user && 
-                        $user['reset_token'] == $input && 
-                        $user['reset_token_expiry'] > date('Y-m-d H:i:s')
-                    );
+                $expiryOk = $user
+                    && !empty($user['reset_token_expiry'])
+                    && $user['reset_token_expiry'] > date('Y-m-d H:i:s');
+                $stored   = isset($user['reset_token']) ? (string) $user['reset_token'] : '';
+                $tokenOk  = $user && $stored !== '' && hash_equals($stored, (string) $input);
+
+                $is_valid = $token_verified || ($expiryOk && $tokenOk);
 
                 if ($is_valid) {
                     $hashed = password_hash($new_pass, PASSWORD_BCRYPT);

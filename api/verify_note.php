@@ -4,6 +4,7 @@
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
 
 header('Content-Type: application/json');
 

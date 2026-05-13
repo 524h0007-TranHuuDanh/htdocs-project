@@ -2,6 +2,9 @@
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json; charset=utf-8');
 
 $note_id = $_POST['note_id'] ?? 0;
 $label_id = $_POST['label_id'] ?? 0;

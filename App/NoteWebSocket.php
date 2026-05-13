@@ -1,132 +1,544 @@
 <?php
+
 namespace App;
 
+
+
+use PDO;
+
 use Ratchet\MessageComponentInterface;
+
 use Ratchet\ConnectionInterface;
 
+
+
 class NoteWebSocket implements MessageComponentInterface {
+
     protected $clients;
+
     protected $noteSubscriptions = []; // note_id => [resourceId => ['conn' => conn, 'user_name' => str]]
 
-    public function __construct() {
-        $this->clients = new \SplObjectStorage;
+    /** @var PDO */
+
+    protected $pdo;
+
+    protected $wsSecret;
+
+
+
+    public function __construct(PDO $pdo, string $wsSecret) {
+
+        $this->clients   = new \SplObjectStorage;
+
+        $this->pdo       = $pdo;
+
+        $this->wsSecret  = $wsSecret;
+
     }
+
+
 
     public function onOpen(ConnectionInterface $conn) {
+
         $this->clients->attach($conn);
+
         $conn->send(json_encode(['type' => 'ping']));
+
         $conn->user_id   = 0;
+
         $conn->user_name = 'Unknown';
+
         echo "[WS] New connection: {$conn->resourceId}\n";
+
     }
 
+
+
     public function onMessage(ConnectionInterface $from, $msg) {
+
         $data = json_decode($msg, true);
+
         if (!$data || !isset($data['type'])) return;
+
+
 
         switch ($data['type']) {
 
+
+
             case 'auth':
-                $uid  = intval($data['user_id'] ?? 0);
-                $name = $data['user_name'] ?? 'User';
-                if ($uid > 0) {
-                    $from->user_id   = $uid;
-                    $from->user_name = $name;
-                    $from->send(json_encode(['type' => 'auth_success']));
-                    echo "[WS] User $uid ($name) authenticated\n";
-                }
+
+                $this->handleAuth($from, $data);
+
                 break;
+
+
 
             case 'join_note':
-                $note_id = intval($data['note_id'] ?? 0);
-                if ($note_id && $from->user_id > 0) {
-                    // Thêm vào phòng
-                    $this->noteSubscriptions[$note_id][$from->resourceId] = [
-                        'conn'      => $from,
-                        'user_name' => $from->user_name
-                    ];
-                    echo "[WS] User {$from->user_id} joined note $note_id\n";
 
-                    // Broadcast danh sách người đang xem
-                    $this->broadcastPresence($note_id);
-                }
+                $this->handleJoinNote($from, $data);
+
                 break;
+
+
 
             case 'leave_note':
+
                 $note_id = intval($data['note_id'] ?? 0);
+
                 $this->removeFromNote($from, $note_id);
+
                 break;
+
+
 
             case 'update':
-                $note_id = intval($data['note_id'] ?? 0);
-                if ($note_id && isset($this->noteSubscriptions[$note_id])) {
 
-                    $broadcastData = [
-                        'type'       => 'update',
-                        'note_id'    => $note_id,
-                        'user_name'  => $from->user_name,
-                        'title'      => $data['title'] ?? null,
-                        'content'    => $data['content'] ?? null,
-                        'sender_id'  => $from->resourceId,
-                        'timestamp'  => time()
-                    ];
+                $this->handleUpdate($from, $data);
 
-                    // Broadcast cho tất cả người KHÁC trong note (không echo lại người gửi)
-                    foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
-                        if ($info['conn'] !== $from) {
-                            $info['conn']->send(json_encode($broadcastData));
-                        }
-                    }
-                }
                 break;
+
         }
+
     }
+
+
 
     /**
-     * Broadcast danh sách người đang xem ghi chú
+
+     * Verify HMAC token; bind identity from DB (ignore client-supplied user_id / user_name).
+
      */
+
+    private function handleAuth(ConnectionInterface $from, array $data) {
+
+        $token = $data['token'] ?? '';
+
+        if (!is_string($token) || $token === '') {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Thiếu token']));
+
+            return;
+
+        }
+
+
+
+        $uid = $this->verifyWsToken($token);
+
+        if ($uid === null) {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Token không hợp lệ hoặc đã hết hạn']));
+
+            return;
+
+        }
+
+
+
+        $stmt = $this->pdo->prepare('SELECT id, display_name FROM users WHERE id = ? LIMIT 1');
+
+        $stmt->execute([$uid]);
+
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+
+
+        if (!$row) {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Người dùng không tồn tại']));
+
+            return;
+
+        }
+
+
+
+        $from->user_id   = (int) $row['id'];
+
+        $from->user_name = $row['display_name'] !== '' && $row['display_name'] !== null
+
+            ? $row['display_name']
+
+            : 'User';
+
+
+
+        $from->send(json_encode(['type' => 'auth_success']));
+
+        echo "[WS] User {$from->user_id} ({$from->user_name}) authenticated via token\n";
+
+    }
+
+
+
+    /**
+
+     * @return int|null user id on success
+
+     */
+
+    private function verifyWsToken(string $token) {
+
+        $parts = explode('.', $token, 2);
+
+        if (count($parts) !== 2) {
+
+            return null;
+
+        }
+
+
+
+        list($payloadB64, $sigB64) = $parts;
+
+        $payloadJson = base64_decode(strtr($payloadB64, '-_', '+/'), true);
+
+        if ($payloadJson === false || $payloadJson === '') {
+
+            return null;
+
+        }
+
+
+
+        $expectedSig = hash_hmac('sha256', $payloadJson, $this->wsSecret, true);
+
+        $sig         = base64_decode(strtr($sigB64, '-_', '+/'), true);
+
+        if (!is_string($sig) || !hash_equals($expectedSig, $sig)) {
+
+            return null;
+
+        }
+
+
+
+        $payload = json_decode($payloadJson, true);
+
+        if (!is_array($payload) || empty($payload['uid']) || empty($payload['exp'])) {
+
+            return null;
+
+        }
+
+
+
+        if ((int) $payload['exp'] < time()) {
+
+            return null;
+
+        }
+
+
+
+        return (int) $payload['uid'];
+
+    }
+
+
+
+    private function handleJoinNote(ConnectionInterface $from, array $data) {
+
+        $note_id = intval($data['note_id'] ?? 0);
+
+        if (!$note_id || $from->user_id <= 0) {
+
+            return;
+
+        }
+
+
+
+        if (!$this->userCanAccessNote((int) $from->user_id, $note_id)) {
+
+            $from->send(json_encode([
+
+                'type'    => 'join_denied',
+
+                'note_id' => $note_id,
+
+                'message' => 'Không có quyền tham gia ghi chú này',
+
+            ]));
+
+            echo "[WS] join_denied user={$from->user_id} note=$note_id\n";
+
+            return;
+
+        }
+
+
+
+        $this->noteSubscriptions[$note_id][$from->resourceId] = [
+
+            'conn'      => $from,
+
+            'user_name' => $from->user_name,
+
+        ];
+
+        echo "[WS] User {$from->user_id} joined note $note_id\n";
+
+
+
+        $this->broadcastPresence($note_id);
+
+    }
+
+
+
+    /**
+
+     * Owner or any active share recipient (same rules as viewing note).
+
+     */
+
+    private function userCanAccessNote(int $userId, int $noteId) {
+
+        $sql = 'SELECT 1 FROM notes n WHERE n.id = ? AND n.is_trashed = 0 AND (
+
+            n.user_id = ?
+
+            OR EXISTS (
+
+                SELECT 1 FROM shared_notes sn
+
+                INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
+
+                WHERE sn.note_id = n.id
+
+            )
+
+        ) LIMIT 1';
+
+        $st = $this->pdo->prepare($sql);
+
+        $st->execute([$noteId, $userId, $userId]);
+
+        return (bool) $st->fetchColumn();
+
+    }
+
+
+
+    /** Owner or shared with edit permission (matches client realtime for editors). */
+
+    private function userCanEditNote(int $userId, int $noteId) {
+
+        $st = $this->pdo->prepare('SELECT 1 FROM notes WHERE id = ? AND user_id = ? LIMIT 1');
+
+        $st->execute([$noteId, $userId]);
+
+        if ($st->fetchColumn()) {
+
+            return true;
+
+        }
+
+
+
+        $st = $this->pdo->prepare(
+
+            "SELECT 1 FROM shared_notes sn
+
+             INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
+
+             WHERE sn.note_id = ? AND sn.permission = 'edit' LIMIT 1"
+
+        );
+
+        $st->execute([$userId, $noteId]);
+
+        return (bool) $st->fetchColumn();
+
+    }
+
+
+
+    /** Persisted notes.version (authoritative for optimistic HTTP saves). */
+
+    private function fetchAuthoritativeNoteVersion(int $noteId) {
+
+        $st = $this->pdo->prepare('SELECT version FROM notes WHERE id = ? AND is_trashed = 0 LIMIT 1');
+
+        $st->execute([$noteId]);
+
+        $v = $st->fetchColumn();
+
+        return $v !== false ? (int) $v : null;
+
+    }
+
+
+
+    private function handleUpdate(ConnectionInterface $from, array $data) {
+
+        $note_id = intval($data['note_id'] ?? 0);
+
+        if (
+
+            !$note_id
+
+            || !isset($this->noteSubscriptions[$note_id][$from->resourceId])
+
+        ) {
+
+            return;
+
+        }
+
+
+
+        if (!$this->userCanEditNote((int) $from->user_id, $note_id)) {
+
+            return;
+
+        }
+
+
+
+        $dbVersion = $this->fetchAuthoritativeNoteVersion($note_id);
+
+        if ($dbVersion === null) {
+
+            return;
+
+        }
+
+
+
+        $broadcastData = [
+
+            'type'       => 'update',
+
+            'note_id'    => $note_id,
+
+            'user_name'  => $from->user_name,
+
+            'title'      => $data['title'] ?? null,
+
+            'content'    => $data['content'] ?? null,
+
+            'version'    => $dbVersion,
+
+            'sender_id'  => $from->resourceId,
+
+            'timestamp'  => time(),
+
+        ];
+
+
+
+        foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
+
+            if ($info['conn'] !== $from) {
+
+                $info['conn']->send(json_encode($broadcastData));
+
+            }
+
+        }
+
+    }
+
+
+
+    /**
+
+     * Broadcast danh sách người đang xem ghi chú
+
+     */
+
     private function broadcastPresence(int $note_id) {
+
         if (!isset($this->noteSubscriptions[$note_id])) return;
 
+
+
         $users = array_values(array_map(
-            fn($info) => $info['user_name'],
+
+            function ($info) {
+
+                return $info['user_name'];
+
+            },
+
             $this->noteSubscriptions[$note_id]
+
         ));
 
+
+
         $payload = json_encode([
-            'type'     => 'presence',
-            'note_id'  => $note_id,
-            'users'    => $users
+
+            'type'    => 'presence',
+
+            'note_id' => $note_id,
+
+            'users'   => $users,
+
         ]);
 
+
+
         foreach ($this->noteSubscriptions[$note_id] as $info) {
+
             $info['conn']->send($payload);
+
         }
+
     }
+
+
 
     private function removeFromNote(ConnectionInterface $conn, int $note_id) {
+
         if ($note_id && isset($this->noteSubscriptions[$note_id])) {
+
             unset($this->noteSubscriptions[$note_id][$conn->resourceId]);
 
+
+
             if (empty($this->noteSubscriptions[$note_id])) {
+
                 unset($this->noteSubscriptions[$note_id]);
+
             } else {
+
                 $this->broadcastPresence($note_id);
+
             }
+
         }
+
     }
+
+
 
     public function onClose(ConnectionInterface $conn) {
-        // Xóa khỏi tất cả các note đang tham gia
+
         foreach (array_keys($this->noteSubscriptions) as $note_id) {
-            $this->removeFromNote($conn, (int)$note_id);
+
+            $this->removeFromNote($conn, (int) $note_id);
+
         }
+
         $this->clients->detach($conn);
+
         echo "[WS] Connection closed: {$conn->resourceId}\n";
+
     }
 
+
+
     public function onError(ConnectionInterface $conn, \Exception $e) {
+
         echo "[WS] Error: {$e->getMessage()}\n";
+
         $conn->close();
+
     }
+
 }
+
