@@ -1,21 +1,16 @@
 <?php
-
-ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
-error_reporting(E_ALL);
+/**
+ * API: Cập nhật thông tin profile người dùng
+ * Đã cải tiến: CSRF, Security, Validation, Error Handling
+ */
 
 session_start();
-
 header('Content-Type: application/json');
 
 require_once __DIR__ . '/../database.php';
 
-// =========================
-// CHECK LOGIN
-// =========================
-$user_id = $_SESSION['user_id'] ?? 0;
-
-if (!$user_id) {
+// ====================== SECURITY CHECK ======================
+if (!isset($_SESSION['user_id']) || empty($_SESSION['user_id'])) {
     echo json_encode([
         'success' => false,
         'message' => 'Chưa đăng nhập'
@@ -23,21 +18,25 @@ if (!$user_id) {
     exit;
 }
 
-// =========================
-// DEFAULT AVATAR
-// =========================
+$user_id = (int)$_SESSION['user_id'];
+
+// CSRF Protection
+if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== ($_SESSION['csrf_token'] ?? '')) {
+    echo json_encode([
+        'success' => false,
+        'message' => 'Yêu cầu không hợp lệ (CSRF)'
+    ]);
+    exit;
+}
+
+// ====================== DEFAULT VALUES ======================
 $default_avatar = 'uploads/avatars/default-avatar.png';
 
-// =========================
-// INPUT
-// =========================
-$font_size   = $_POST['font_size'] ?? '16px';
+// ====================== INPUT VALIDATION ======================
+$font_size   = $_POST['font_size']   ?? '16px';
 $theme_color = $_POST['theme_color'] ?? 'light';
-$note_color  = $_POST['note_color'] ?? '#ffffff';
+$note_color  = $_POST['note_color']  ?? '#ffffff';
 
-// =========================
-// VALIDATE
-// =========================
 $allowed_fonts  = ['14px', '16px', '18px'];
 $allowed_themes = ['light', 'dark'];
 
@@ -53,81 +52,73 @@ if (!preg_match('/^#[0-9A-Fa-f]{6}$/', $note_color)) {
     $note_color = '#ffffff';
 }
 
+// ====================== CURRENT AVATAR ======================
+$avatar_path = !empty($_SESSION['avatar']) 
+    ? $_SESSION['avatar'] 
+    : $default_avatar;
+
 try {
-
-    // =========================
-    // CURRENT AVATAR
-    // =========================
-    $avatar_path = !empty($_SESSION['avatar'])
-        ? $_SESSION['avatar']
-        : $default_avatar;
-
-    // =========================
-    // UPLOAD NEW AVATAR
-    // =========================
-    if (
-        isset($_FILES['avatar']) &&
-        $_FILES['avatar']['error'] === UPLOAD_ERR_OK
-    ) {
-
+    // ====================== UPLOAD AVATAR ======================
+    if (isset($_FILES['avatar']) && $_FILES['avatar']['error'] === UPLOAD_ERR_OK) {
+        $file = $_FILES['avatar'];
         $upload_dir = __DIR__ . '/../uploads/avatars/';
 
-        // Tạo folder nếu chưa có
+        // Tạo thư mục nếu chưa tồn tại
         if (!is_dir($upload_dir)) {
-            mkdir($upload_dir, 0777, true);
+            mkdir($upload_dir, 0755, true);
         }
 
-        // Extension
-        $ext = strtolower(
-            pathinfo($_FILES['avatar']['name'], PATHINFO_EXTENSION)
-        );
-
-        // Cho phép
-        $allowed_ext = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-
-        if (!in_array($ext, $allowed_ext)) {
-            throw new Exception('File ảnh không hợp lệ');
+        // Kiểm tra kích thước (tối đa 2MB)
+        $max_size = 2 * 1024 * 1024;
+        if ($file['size'] > $max_size) {
+            throw new Exception('Ảnh đại diện không được vượt quá 2MB');
         }
 
-        // Tên file mới
-        $new_name = 'avatar_' . $user_id . '_' . time() . '.' . $ext;
+        // Kiểm tra MIME type an toàn
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime_type = finfo_file($finfo, $file['tmp_name']);
+        finfo_close($finfo);
 
-        $target = $upload_dir . $new_name;
-
-        // Upload
-        if (!move_uploaded_file($_FILES['avatar']['tmp_name'], $target)) {
-            throw new Exception('Upload avatar thất bại');
+        $allowed_mimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (!in_array($mime_type, $allowed_mimes)) {
+            throw new Exception('Chỉ chấp nhận file ảnh (jpg, png, gif, webp)');
         }
 
-        // =========================
-        // DELETE OLD AVATAR
-        // =========================
-        if (
-            !empty($_SESSION['avatar']) &&
-            $_SESSION['avatar'] !== $default_avatar
-        ) {
+        // Tạo tên file an toàn
+        $ext_map = [
+            'image/jpeg' => 'jpg',
+            'image/png'  => 'png',
+            'image/gif'  => 'gif',
+            'image/webp' => 'webp'
+        ];
+        $extension = $ext_map[$mime_type];
+        $new_filename = 'avatar_' . $user_id . '_' . time() . '.' . $extension;
+        $target_path = $upload_dir . $new_filename;
+        $db_path = 'uploads/avatars/' . $new_filename;
 
+        // Upload file
+        if (!move_uploaded_file($file['tmp_name'], $target_path)) {
+            throw new Exception('Không thể tải lên ảnh đại diện');
+        }
+
+        // Xóa avatar cũ nếu không phải avatar mặc định
+        if (!empty($_SESSION['avatar']) && $_SESSION['avatar'] !== $default_avatar) {
             $old_file = __DIR__ . '/../' . $_SESSION['avatar'];
-
             if (file_exists($old_file)) {
-                unlink($old_file);
+                @unlink($old_file);
             }
         }
 
-        // Avatar mới
-        $avatar_path = 'uploads/avatars/' . $new_name;
+        $avatar_path = $db_path;
     }
 
-    // =========================
-    // UPDATE DB
-    // =========================
+    // ====================== UPDATE DATABASE ======================
     $stmt = $pdo->prepare("
-        UPDATE users
-        SET
-            font_size = ?,
-            theme_color = ?,
-            note_color = ?,
-            avatar = ?
+        UPDATE users 
+        SET font_size = ?, 
+            theme_color = ?, 
+            note_color = ?, 
+            avatar = ? 
         WHERE id = ?
     ");
 
@@ -139,29 +130,23 @@ try {
         $user_id
     ]);
 
-    // =========================
-    // UPDATE SESSION
-    // =========================
+    // ====================== UPDATE SESSION ======================
     $_SESSION['font_size']   = $font_size;
     $_SESSION['theme_color'] = $theme_color;
     $_SESSION['note_color']  = $note_color;
     $_SESSION['avatar']      = $avatar_path;
 
-    // =========================
-    // SUCCESS
-    // =========================
     echo json_encode([
         'success' => true,
-        'message' => 'Cập nhật thành công',
-        'avatar' => $avatar_path
+        'message' => 'Cập nhật thông tin thành công',
+        'avatar'  => $avatar_path
     ]);
 
 } catch (Exception $e) {
-
-    http_response_code(500);
-
+    error_log("Update Profile Error (User ID: $user_id): " . $e->getMessage());
+    
     echo json_encode([
         'success' => false,
-        'message' => $e->getMessage()
+        'message' => $e->getMessage() ?: 'Lỗi hệ thống. Vui lòng thử lại sau.'
     ]);
 }

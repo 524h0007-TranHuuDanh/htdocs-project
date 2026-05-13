@@ -1,6 +1,7 @@
 <?php
 require_once 'auth_helper.php';
 require_once '../database.php';
+require_once '../mail_config.php';
 check_login();
 
 header('Content-Type: application/json');
@@ -10,20 +11,26 @@ $note_id    = intval($_POST['note_id'] ?? 0);
 $share_with = trim($_POST['share_with'] ?? '');
 $permission = $_POST['permission'] ?? 'read';
 
+// CSRF
+if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== ($_SESSION['csrf_token'] ?? '')) {
+    echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ (CSRF)']);
+    exit;
+}
+
 if ($note_id <= 0 || empty($share_with)) {
     echo json_encode(['success' => false, 'message' => 'Dữ liệu không hợp lệ!']);
     exit;
 }
 
-if (!in_array($permission, ['read', 'edit'])) {
-    $permission = 'read';
-}
+if (!in_array($permission, ['read', 'edit'])) $permission = 'read';
 
 try {
-    // Kiểm tra ghi chú thuộc về owner
-    $noteCheck = $pdo->prepare("SELECT id FROM notes WHERE id = ? AND user_id = ?");
+    // Kiểm tra owner
+    $noteCheck = $pdo->prepare("SELECT id, title FROM notes WHERE id = ? AND user_id = ?");
     $noteCheck->execute([$note_id, $sender_id]);
-    if (!$noteCheck->fetch()) {
+    $note = $noteCheck->fetch();
+
+    if (!$note) {
         echo json_encode(['success' => false, 'message' => 'Bạn không có quyền chia sẻ ghi chú này!']);
         exit;
     }
@@ -32,56 +39,51 @@ try {
     $successCount = 0;
     $messages = [];
 
-    foreach ($emails as $shareWith) {
-        if (empty($shareWith)) continue;
+    $senderName = $_SESSION['display_name'] ?? 'Một người dùng';
 
-        // Tìm người nhận theo email hoặc display_name
-        $stmt = $pdo->prepare("SELECT id, email, display_name FROM users 
-                              WHERE email = ? OR display_name = ? LIMIT 1");
-        $stmt->execute([$shareWith, $shareWith]);
-        $receiver = $stmt->fetch(PDO::FETCH_ASSOC);
+    foreach ($emails as $email) {
+        if (empty($email)) continue;
 
-        if (!$receiver) {
-            $messages[] = "Không tìm thấy: " . htmlspecialchars($shareWith);
-            continue;
-        }
+        $stmt = $pdo->prepare("SELECT id, email, display_name FROM users WHERE email = ? LIMIT 1");
+        $stmt->execute([$email]);
+        $receiver = $stmt->fetch();
 
-        if ($receiver['id'] == $sender_id) {
-            $messages[] = "Không thể chia sẻ cho chính mình";
+        if (!$receiver || $receiver['id'] == $sender_id) {
+            $messages[] = "Không hợp lệ: " . htmlspecialchars($email);
             continue;
         }
 
         $recipient_email = $receiver['email'];
 
-        // Kiểm tra đã chia sẻ chưa
+        // Kiểm tra đã share chưa
         $check = $pdo->prepare("SELECT id FROM shared_notes WHERE note_id = ? AND recipient_email = ?");
         $check->execute([$note_id, $recipient_email]);
 
         if ($check->fetch()) {
-            // Cập nhật quyền
             $update = $pdo->prepare("UPDATE shared_notes SET permission = ? WHERE note_id = ? AND recipient_email = ?");
             $update->execute([$permission, $note_id, $recipient_email]);
             $messages[] = "Đã cập nhật quyền cho " . htmlspecialchars($receiver['display_name']);
         } else {
-            // Thêm mới
-            $insert = $pdo->prepare("INSERT INTO shared_notes (note_id, owner_id, recipient_email, permission) 
-                                    VALUES (?, ?, ?, ?)");
+            $insert = $pdo->prepare("INSERT INTO shared_notes (note_id, owner_id, recipient_email, permission) VALUES (?, ?, ?, ?)");
             $insert->execute([$note_id, $sender_id, $recipient_email, $permission]);
+            
+            // Gửi email thông báo
+            sendShareNotification($recipient_email, $receiver['display_name'], $senderName, $note['title']);
+            
             $messages[] = "Đã chia sẻ thành công cho " . htmlspecialchars($receiver['display_name']);
         }
         $successCount++;
     }
 
-    $finalMessage = $successCount > 0 
-        ? "Đã chia sẻ cho $successCount người.\n" . implode("\n", $messages)
-        : "Không chia sẻ được cho ai.";
-
     echo json_encode([
         'success' => $successCount > 0,
-        'message' => $finalMessage
+        'message' => $successCount > 0 
+            ? "Đã chia sẻ cho $successCount người.\n" . implode("\n", $messages)
+            : "Không chia sẻ được cho ai."
     ]);
 
 } catch (PDOException $e) {
-    echo json_encode(['success' => false, 'message' => 'Lỗi database: ' . $e->getMessage()]);
+    error_log("Share Note Error: " . $e->getMessage());
+    echo json_encode(['success' => false, 'message' => 'Lỗi database']);
 }
 ?>

@@ -67,10 +67,12 @@ try {
     $params[] = $searchTerm;
     $params[] = $searchTerm;
 
+    
+
     if ($view_mode === 'shared') {
         $sql .= " ORDER BY sn.shared_at DESC, n.updated_at DESC";
     } else {
-        $sql .= " ORDER BY n.is_pinned DESC, n.pinned_at DESC, n.updated_at DESC";
+        $sql .= " ORDER BY n.is_pinned DESC, n.pinned_at DESC, n.updated_at DESC, n.created_at DESC";
     }
 
     $stmt = $pdo->prepare($sql);

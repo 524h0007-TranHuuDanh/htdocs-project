@@ -5,37 +5,46 @@ require_once 'database.php';
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $email = trim($_POST['email'] ?? '');
-    $password = $_POST['password'] ?? '';
-
-    if (empty($email) || empty($password)) {
-        $error = "Vui lòng nhập đầy đủ thông tin!";
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        $error = "Yêu cầu không hợp lệ!";
     } else {
-        try {
-            $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ? LIMIT 1");
-            $stmt->execute([$email]);
-            $user = $stmt->fetch();
+        $email    = trim($_POST['email'] ?? '');
+        $password = $_POST['password'] ?? '';
 
-            if (!$user || !password_verify($password, $user['password_hash'])) {
-                $error = "Email hoặc mật khẩu không chính xác!";
-            } else {
-                // === CHO PHÉP ĐĂNG NHẬP DÙ CHƯA KÍCH HOẠT ===
-                $_SESSION['user_id']      = $user['id'];
-                $_SESSION['display_name'] = $user['display_name'];
-                $_SESSION['avatar']       = $user['avatar'] ?? 'default-avatar.png';
-                $_SESSION['font_size']    = $user['font_size'] ?? '16px';
-                $_SESSION['theme_color']  = $user['theme_color'] ?? 'light';
-                $_SESSION['note_color']   = $user['note_color'] ?? '#ffffff';
-                $_SESSION['is_activated'] = (int)$user['is_activated'];
+        if (empty($email) || empty($password)) {
+            $error = "Vui lòng nhập đầy đủ thông tin!";
+        } else {
+            try {
+                $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ? LIMIT 1");
+                $stmt->execute([$email]);
+                $user = $stmt->fetch();
 
-                header("Location: index.php");
-                exit;
+                if (!$user || !password_verify($password, $user['password_hash'])) {
+                    $error = "Email hoặc mật khẩu không chính xác!";
+                } else {
+                    // Auto login dù chưa activate
+                    $_SESSION['user_id']      = $user['id'];
+                    $_SESSION['display_name'] = $user['display_name'];
+                    $_SESSION['avatar']       = $user['avatar'] ?? 'uploads/avatars/default-avatar.png';
+                    $_SESSION['font_size']    = $user['font_size'] ?? '16px';
+                    $_SESSION['theme_color']  = $user['theme_color'] ?? 'light';
+                    $_SESSION['note_color']   = $user['note_color'] ?? '#ffffff';
+                    $_SESSION['is_activated'] = (int)$user['is_activated'];
+
+                    session_regenerate_id(true);
+
+                    header("Location: index.php");
+                    exit;
+                }
+            } catch (PDOException $e) {
+                $error = "Lỗi hệ thống. Vui lòng thử lại sau!";
+                error_log("Login Error: " . $e->getMessage());
             }
-        } catch (PDOException $e) {
-            $error = "Lỗi hệ thống!";
         }
     }
 }
+
+$_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -61,10 +70,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <?php endif; ?>
 
                 <?php if (isset($_GET['activated'])): ?>
-                    <div class="alert alert-success">Kích hoạt tài khoản thành công! Hãy đăng nhập.</div>
+                    <div class="alert alert-success">Kích hoạt tài khoản thành công!</div>
                 <?php endif; ?>
 
                 <form method="POST">
+                    <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                     <div class="mb-3">
                         <label class="form-label">Email</label>
                         <input type="email" name="email" class="form-control" required>

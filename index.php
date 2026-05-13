@@ -2,6 +2,10 @@
 require_once 'api/auth_helper.php';
 check_login();
 
+if (!isset($_SESSION['last_regen']) || time() - $_SESSION['last_regen'] > 3600) {
+    session_regenerate_id(true);
+    $_SESSION['last_regen'] = time();
+}
 // Avatar mặc định
 $default_avatar = 'uploads/avatars/default-avatar.png';
 
@@ -34,7 +38,17 @@ $user_avatar = !empty($_SESSION['avatar'])
     <link rel="stylesheet" href="assets/css/style.css">
 
     <style>
-        body { font-size: <?= htmlspecialchars($user_font_size) ?> !important; }
+        body { 
+            font-size: <?= htmlspecialchars($user_font_size) ?>; 
+        }
+        
+        :root {
+            --note-default-color: <?= htmlspecialchars($user_note_color) ?>;
+        }
+        
+        .note-card {
+            background-color: var(--note-default-color) !important;
+        }
     </style>
 </head>
 <body class="bg-body text-body">
@@ -109,8 +123,9 @@ $user_avatar = !empty($_SESSION['avatar'])
 <!-- APP CONFIG -->
 <script>
     window.APP_CONFIG = {
-        userId:   <?= (int)($_SESSION['user_id'] ?? 0) ?>,
-        userName: "<?= addslashes($_SESSION['display_name'] ?? 'User') ?>"
+        userId:      <?= (int)($_SESSION['user_id'] ?? 0) ?>,
+        userName:    "<?= addslashes($_SESSION['display_name'] ?? 'User') ?>",
+        csrf_token:  "<?= $_SESSION['csrf_token'] ?? '' ?>"
     };
 </script>
 

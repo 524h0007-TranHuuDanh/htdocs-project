@@ -14,6 +14,7 @@ class NoteWebSocket implements MessageComponentInterface {
 
     public function onOpen(ConnectionInterface $conn) {
         $this->clients->attach($conn);
+        $conn->send(json_encode(['type' => 'ping']));
         $conn->user_id   = 0;
         $conn->user_name = 'Unknown';
         echo "[WS] New connection: {$conn->resourceId}\n";

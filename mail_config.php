@@ -165,3 +165,78 @@ function sendResetLinkEmail($toEmail, $displayName, $reset_token)
         return false;
     }
 }
+/**
+ * Gửi thông báo mật khẩu đã thay đổi
+ */
+function sendPasswordChangedNotification($toEmail, $displayName)
+{
+    $mail = new PHPMailer(true);
+    try {
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';
+        $mail->SMTPAuth = true;
+        $mail->Username = 'trandanh020906@gmail.com';
+        $mail->Password = 'jwlpqzuycmtidnli';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port = 587;
+
+        $mail->CharSet = 'UTF-8';
+        $mail->setFrom('trandanh020906@gmail.com', 'Note App');
+        $mail->addAddress($toEmail, $displayName);
+
+        $mail->isHTML(true);
+        $mail->Subject = 'Thông báo: Mật khẩu tài khoản Note App đã được thay đổi';
+
+        $mail->Body = "
+            <div style='font-family:Arial,sans-serif; max-width:600px; margin:auto; padding:20px; border:1px solid #ddd; border-radius:8px;'>
+                <h2 style='color:#0d6efd;'>Xin chào {$displayName},</h2>
+                <p>Mật khẩu tài khoản Note App của bạn vừa được thay đổi thành công.</p>
+                <p>Nếu bạn không thực hiện thay đổi này, vui lòng liên hệ ngay với chúng tôi.</p>
+                <p>Trân trọng,<br>Đội ngũ Note App</p>
+            </div>
+        ";
+
+        $mail->send();
+    } catch (Exception $e) {
+        error_log("Password Changed Notification Error: " . $e->getMessage());
+    }
+}
+/**
+ * Gửi email thông báo khi note được chia sẻ (Better Approach)
+ */
+function sendShareNotification($toEmail, $displayName, $sharerName, $noteTitle)
+{
+    $mail = new PHPMailer(true);
+    try {
+        $mail->isSMTP();
+        $mail->Host = 'smtp.gmail.com';
+        $mail->SMTPAuth = true;
+        $mail->Username = 'trandanh020906@gmail.com';
+        $mail->Password = 'jwlpqzuycmtidnli';
+        $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port = 587;
+
+        $mail->CharSet = 'UTF-8';
+        $mail->setFrom('trandanh020906@gmail.com', 'Note App');
+        $mail->addAddress($toEmail, $displayName);
+
+        $mail->isHTML(true);
+        $mail->Subject = 'Bạn được chia sẻ một ghi chú';
+
+        $mail->Body = "
+            <div style='font-family:Arial,sans-serif; max-width:600px; margin:auto; padding:25px; border:1px solid #ddd; border-radius:10px;'>
+                <h2 style='color:#0d6efd;'>Xin chào {$displayName},</h2>
+                <p><strong>{$sharerName}</strong> đã chia sẻ một ghi chú với bạn:</p>
+                <p style='font-size:18px; font-weight:600; color:#333;'>📝 {$noteTitle}</p>
+                <p>Bạn có thể xem ngay trong phần <strong>Được chia sẻ</strong>.</p>
+                <p style='color:#666;'>Trân trọng,<br>Đội ngũ Note App</p>
+            </div>
+        ";
+
+        $mail->send();
+        return true;
+    } catch (Exception $e) {
+        error_log("Share Notification Error: " . $e->getMessage());
+        return false;
+    }
+}

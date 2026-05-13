@@ -1,3 +1,4 @@
+//code//
 // ====================== BIẾN TOÀN CỤC ======================
 // currentUserId và currentUserName được inject từ index.php qua window.APP_CONFIG
 const noteModal = new bootstrap.Modal(document.getElementById('noteModal'));
@@ -224,7 +225,17 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     document.getElementById('imagePreviewContainer').innerHTML = '';
     document.getElementById('noteLabelsContainer').innerHTML   = '';
     document.getElementById('saveStatus').innerText = '';
-    document.getElementById('modalContentWrapper').style.backgroundColor = color || 'var(--bs-body-bg)';
+         // === ÁP DỤNG MÀU GHI CHÚ ===
+    const modalWrapper = document.getElementById('modalContentWrapper');
+    
+    if (color && color.trim() !== '') {
+        modalWrapper.style.backgroundColor = color;
+        modalWrapper.style.setProperty('--note-individual-color', color);
+    } else {
+        const defaultColor = document.documentElement.style.getPropertyValue('--note-default-color') || '#ffffff';
+        modalWrapper.style.backgroundColor = defaultColor;
+        modalWrapper.style.setProperty('--note-individual-color', defaultColor);
+    }
 
     const isTrash  = currentViewMode === 'trash';
     const isShared = currentViewMode === 'shared';
@@ -285,7 +296,15 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     if (id && (permission === 'edit' || permission === 'owner')) {
         startRealtimeForNote(id, permission);
     }
+    if (!id) {
+    document.getElementById('noteTitle').placeholder = "Nhập tiêu đề ghi chú...";
+    document.getElementById('noteContent').placeholder = "Nhập nội dung ghi chú của bạn...";
+    }
 
+    if (!color) {
+        document.getElementById('modalContentWrapper').style.backgroundColor = 
+            document.documentElement.style.getPropertyValue('--note-default-color') || '#ffffff';
+    }
     noteModal.show();
 }
 
@@ -303,31 +322,86 @@ function closeAndReload() {
     liveSearch();
 }
 
-// ====================== AUTO SAVE ======================
+// ====================== AUTO SAVE (GIỮ NGUYÊN LOGIC CŨ + OFFLINE) ======================
+let autoSaveTimer = null;
+let isSaving = false;
+
 function autoSave() {
     if (currentViewMode === 'trash' || currentPermission === 'read') return;
-    document.getElementById('saveStatus').innerText = 'Đang lưu...';
-    clearTimeout(typingTimer);
-    typingTimer = setTimeout(() => {
-        const id = document.getElementById('noteId').value;
-        const t  = document.getElementById('noteTitle').value;
-        const c  = document.getElementById('noteContent').value;
-        if (!t.trim() && !c.trim()) return;
+    if (isSaving) return;
+
+    const noteId = document.getElementById('noteId').value;
+    const title  = document.getElementById('noteTitle').value.trim();
+    const content = document.getElementById('noteContent').value;
+
+    // Không lưu nếu cả title và content đều rỗng
+    if (!noteId && !title && !content) return;
+
+    document.getElementById('saveStatus').innerHTML = 
+        '<i class="bi bi-hourglass-split"></i> Đang lưu...';
+
+    clearTimeout(autoSaveTimer);
+    
+    autoSaveTimer = setTimeout(() => {
+        isSaving = true;
+        
+        const fd = new FormData();
+        fd.append('id', noteId);
+        fd.append('title', title);
+        fd.append('content', content);
+        fd.append('version', document.getElementById('noteContent').dataset.version || 1);
+        fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+
         fetch('api/save_note.php', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `id=${encodeURIComponent(id)}&title=${encodeURIComponent(t)}&content=${encodeURIComponent(c)}`
-        }).then(res => res.json()).then(d => {
-            if (d.success && !id) {
-                document.getElementById('noteId').value = d.note_id;
-                document.getElementById('toolsSection').style.display        = 'block';
-                document.getElementById('colorSection').style.display        = 'block';
-                document.getElementById('shareManagerSection').style.display = 'block';
-                document.getElementById('btnTrashNote').style.display        = 'block';
-                refreshLabelSelector();
+            body: fd
+        })
+        .then(res => res.json())
+        .then(d => {
+            isSaving = false;
+            const statusEl = document.getElementById('saveStatus');
+            
+            if (d.success) {
+                statusEl.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> Đã lưu';
+                showToast('Đã lưu ghi chú', 'success');
+                
+                if (!noteId && d.note_id) {
+                    document.getElementById('noteId').value = d.note_id;
+                    document.getElementById('noteContent').dataset.version = d.version;
+                    
+                    // Bật các tính năng sau khi tạo note thành công
+                    document.getElementById('toolsSection').style.display = 'block';
+                    document.getElementById('colorSection').style.display = 'block';
+                    document.getElementById('shareManagerSection').style.display = 'block';
+                    document.getElementById('btnTrashNote').style.display = 'block';
+                }
+                
+                if (d.version) {
+                    document.getElementById('noteContent').dataset.version = d.version;
+                }
+                
+                liveSearch();
+            } else {
+                statusEl.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> Lỗi lưu';
+                if (d.message) showToast(d.message, 'danger');
             }
-            document.getElementById('saveStatus').innerText = d.success ? 'Đã lưu' : 'Lỗi lưu!';
-            if (d.success) liveSearch();
+        })
+        .catch(() => {
+            isSaving = false;
+            // === OFFLINE FALLBACK ===
+            document.getElementById('saveStatus').innerHTML = 
+                '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
+            
+            const noteData = {
+                id: noteId || 'temp_' + Date.now(),
+                title: title,
+                content: content,
+                version: parseInt(document.getElementById('noteContent').dataset.version) || 1,
+                updated_at: new Date().toISOString()
+            };
+            
+            saveNoteOffline(noteData);
+            showToast('Không kết nối mạng. Ghi chú đã được lưu cục bộ.', 'warning');
         });
     }, 800);
 }
@@ -337,25 +411,27 @@ function shareNote() {
     const noteId = document.getElementById('noteId').value;
     const input  = document.getElementById('share_input').value.trim();
     const perm   = document.getElementById('sharePermission').value;
-    if (!noteId) return alert('Vui lòng lưu ghi chú trước!');
+
+    if (!noteId) return alert('Vui lòng lưu ghi chú trước khi chia sẻ!');
     if (!input)  return alert('Vui lòng nhập email!');
 
-    const emails = input.split(',').map(e => e.trim()).filter(Boolean);
     const fd = new FormData();
     fd.append('note_id', noteId);
     fd.append('permission', perm);
-    fd.append('share_with', emails.join(','));
+    fd.append('share_with', input);
+    fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
 
     fetch('api/share_note.php', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(d => {
-            alert(d.message);
+            showAlert(d.message || 'Đã thực hiện chia sẻ', d.success ? 'success' : 'danger');
             if (d.success) {
                 document.getElementById('share_input').value = '';
                 loadSharedUsers(noteId);
                 liveSearch();
             }
-        });
+        })
+        .catch(() => showAlert('Lỗi khi chia sẻ!', 'danger'));
 }
 
 function loadSharedUsers(noteId) {
@@ -372,14 +448,31 @@ function loadSharedUsers(noteId) {
 }
 
 function revokeShare(shareId) {
-    if (!confirm('Thu hồi quyền?')) return;
-    const fd = new FormData();
-    fd.append('share_id', shareId);
-    fetch('api/revoke_share.php', { method: 'POST', body: fd })
-        .then(() => loadSharedUsers(document.getElementById('noteId').value));
+    showConfirm('Thu hồi quyền chia sẻ này?', () => {
+        const fd = new FormData();
+        fd.append('share_id', shareId);
+        
+        fetch('api/revoke_share.php', { 
+            method: 'POST', 
+            body: fd 
+        })
+        .then(r => r.json())           // ← thêm dòng này để lấy kết quả
+        .then(data => {
+            loadSharedUsers(document.getElementById('noteId').value);
+            
+            if (data.success) {
+                showAlert('Đã thu hồi quyền chia sẻ thành công', 'success');
+            } else {
+                showAlert(data.message || 'Đã thu hồi quyền chia sẻ', 'success');
+            }
+        })
+        .catch(() => {
+            showAlert('Lỗi khi thu hồi quyền!', 'danger');
+        });
+    });
 }
 
-// ====================== KHÓA GHI CHÚ ======================
+// ====================== KHÓA GHI CHÚ (CẢI TIẾN BETTER APPROACH) ======================
 function toggleLock() {
     const id = document.getElementById('noteId').value;
     if (!id) return;
@@ -401,10 +494,17 @@ function _showLockSetModal(id) {
             const [pw, pw2] = vals;
             if (pw.length < 4) return showError('Mật khẩu phải có ít nhất 4 ký tự!');
             if (pw !== pw2)    return showError('Mật khẩu xác nhận không khớp!');
+
+            const fd = new FormData();
+            fd.append('note_id', id);
+            fd.append('action', 'lock');
+            fd.append('password', pw);
+            fd.append('confirm_password', pw2);
+            fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
+
             return fetch('api/lock_note.php', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({ note_id: id, action: 'lock', password: pw })
+                body: fd
             }).then(r => r.json()).then(d => {
                 if (d.success) {
                     isLockedState = true;
@@ -432,38 +532,40 @@ function _showLockActionPicker(id) {
         onConfirm(vals, showError, actionValue) {
             const [oldPw] = vals;
             if (!oldPw) return showError('Vui lòng nhập mật khẩu hiện tại!');
+
+            const fd = new FormData();
+            fd.append('note_id', id);
+            fd.append('old_password', oldPw);
+            fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
+
             if (actionValue === 'unlock') {
-                return _doUnlock(id, oldPw, showError);
+                fd.append('action', 'unlock');
+                return fetch('api/lock_note.php', { method: 'POST', body: fd })
+                    .then(r => r.json()).then(d => {
+                        if (d.success) {
+                            isLockedState = false;
+                            document.getElementById('btnLock').innerHTML = '<i class="bi bi-lock"></i> Đặt mật khẩu';
+                            liveSearch();
+                            return true;
+                        }
+                        showError(d.message || 'Mật khẩu không đúng!');
+                        return false;
+                    });
             } else {
-                return fetch('api/lock_note.php', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams({ note_id: id, action: 'verify', old_password: oldPw })
-                }).then(r => r.json()).then(d => {
-                    if (!d.success) { showError(d.message || 'Mật khẩu không đúng!'); return false; }
-                    passwordModalInstance.hide();
-                    setTimeout(() => _showChangePasswordModal(id, oldPw), 300);
-                    return false;
-                });
+                // Verify trước khi đổi mật khẩu
+                fd.append('action', 'verify');
+                return fetch('api/lock_note.php', { method: 'POST', body: fd })
+                    .then(r => r.json()).then(d => {
+                        if (!d.success) { 
+                            showError(d.message || 'Mật khẩu không đúng!'); 
+                            return false; 
+                        }
+                        passwordModalInstance.hide();
+                        setTimeout(() => _showChangePasswordModal(id, oldPw), 300);
+                        return false;
+                    });
             }
         }
-    });
-}
-
-function _doUnlock(id, oldPw, showError) {
-    return fetch('api/lock_note.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ note_id: id, action: 'unlock', old_password: oldPw })
-    }).then(r => r.json()).then(d => {
-        if (d.success) {
-            isLockedState = false;
-            document.getElementById('btnLock').innerHTML = '<i class="bi bi-lock"></i> Đặt mật khẩu';
-            liveSearch();
-            return true;
-        }
-        showError(d.message || 'Mật khẩu không đúng!');
-        return false;
     });
 }
 
@@ -478,19 +580,29 @@ function _showChangePasswordModal(id, oldPw) {
             const [pw, pw2] = vals;
             if (pw.length < 4) return showError('Mật khẩu phải có ít nhất 4 ký tự!');
             if (pw !== pw2)    return showError('Mật khẩu xác nhận không khớp!');
-            return fetch('api/lock_note.php', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({ note_id: id, action: 'change', old_password: oldPw, password: pw })
-            }).then(r => r.json()).then(d => {
-                if (d.success) { liveSearch(); return true; }
-                showError(d.message || 'Không thể đổi mật khẩu!');
-                return false;
-            });
+
+            const fd = new FormData();
+            fd.append('note_id', id);
+            fd.append('action', 'change');
+            fd.append('old_password', oldPw);
+            fd.append('password', pw);
+            fd.append('confirm_password', pw2);
+            fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
+
+            return fetch('api/lock_note.php', { method: 'POST', body: fd })
+                .then(r => r.json()).then(d => {
+                    if (d.success) { 
+                        liveSearch(); 
+                        return true; 
+                    }
+                    showError(d.message || 'Không thể đổi mật khẩu!');
+                    return false;
+                });
         }
     });
 }
 
+// Giữ nguyên hàm _openPasswordModal của bạn (không thay đổi)
 function _openPasswordModal(config) {
     const titleEl  = document.getElementById('passwordModalTitle');
     const bodyEl   = document.getElementById('passwordModal').querySelector('.modal-body');
@@ -511,7 +623,10 @@ function _openPasswordModal(config) {
     function showError(msg) {
         errorEl.textContent = msg;
         errorEl.style.display = 'block';
-        footerEl.querySelectorAll('.pm-action-btn').forEach(b => { b.disabled = false; b.textContent = b.dataset.origLabel; });
+        footerEl.querySelectorAll('.pm-action-btn').forEach(b => { 
+            b.disabled = false; 
+            b.textContent = b.dataset.origLabel; 
+        });
     }
 
     footerEl.querySelectorAll('.pm-action-btn').forEach(btn => {
@@ -521,9 +636,14 @@ function _openPasswordModal(config) {
             const vals = config.fields.map(f => document.getElementById(f.id).value.trim());
             footerEl.querySelectorAll('.pm-action-btn').forEach(b => { b.disabled = true; });
             btn.textContent = 'Đang xử lý...';
+            
             Promise.resolve(config.onConfirm(vals, showError, btn.dataset.action))
-                .then(shouldClose => { if (shouldClose === true) passwordModalInstance.hide(); })
-                .catch(() => { showError('Lỗi kết nối, vui lòng thử lại!'); });
+                .then(shouldClose => { 
+                    if (shouldClose === true) passwordModalInstance.hide(); 
+                })
+                .catch(() => { 
+                    showError('Lỗi kết nối, vui lòng thử lại!'); 
+                });
         });
     });
 
@@ -535,39 +655,69 @@ function _openPasswordModal(config) {
     passwordModalInstance.show();
 }
 
-// ====================== XÓA GHI CHÚ ======================
+// ====================== XÓA GHI CHÚ (MODAL ĐẸP) ======================
+let currentDeleteId = null;
+let currentDeleteAction = null;
+
 function deleteNote(action) {
     const id = document.getElementById('noteId').value;
     if (!id) return;
-    const confirmMsg = action === 'trash' ? 'Chuyển vào thùng rác?' : 'Xóa vĩnh viễn? Hành động này không thể hoàn tác!';
-    if (!confirm(confirmMsg)) return;
-    if (isLockedState) {
-        _deleteNoteWithPassword(id, action, null);
-    } else {
-        _doDeleteNote(id, action);
-    }
+
+    currentDeleteId = id;
+    currentDeleteAction = action;
+
+    const isPermanent = action === 'permanent';
+    const title = isPermanent ? 'Xóa vĩnh viễn ghi chú?' : 'Chuyển vào thùng rác?';
+    const bodyText = isPermanent 
+        ? 'Hành động này <strong>không thể hoàn tác</strong>.' 
+        : 'Ghi chú sẽ được chuyển vào thùng rác.';
+
+    document.getElementById('deleteModalTitle').innerHTML = 
+        `<i class="bi bi-trash3"></i> ${title}`;
+    document.getElementById('deleteModalBody').innerHTML = 
+        `<p>${bodyText}</p>`;
+
+    const deleteModal = new bootstrap.Modal(document.getElementById('deleteConfirmModal'));
+    deleteModal.show();
+
+    // Xử lý nút Xác nhận
+    document.getElementById('confirmDeleteBtn').onclick = function() {
+        deleteModal.hide();
+        if (isLockedState) {
+            _deleteNoteWithPassword(id, action);
+        } else {
+            _doDeleteNote(id, action);
+        }
+    };
 }
 
 function _doDeleteNote(id, action) {
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('action', action);
+    fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+
     fetch('api/delete_note.php', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ id, action, delete_password: '' }).toString()
+        body: fd
     })
     .then(res => res.json())
     .then(d => {
         if (d.success) {
+            showToast(d.message || 'Đã thực hiện thành công', 'success');
             closeAndReload();
         } else if (d.require_password) {
-            _deleteNoteWithPassword(id, action, d.message);
+            _deleteNoteWithPassword(id, action);
         } else {
-            alert(d.error || 'Không thể xóa ghi chú!');
+            showToast(d.message || 'Không thể xóa ghi chú!', 'danger');
         }
     })
-    .catch(() => alert('Lỗi kết nối khi xóa ghi chú!'));
+    .catch(() => {
+        showToast('Lỗi kết nối khi xóa ghi chú!', 'danger');
+    });
 }
 
-function _deleteNoteWithPassword(id, action, errorMsg) {
+function _deleteNoteWithPassword(id, action) {
     const titleEl    = document.getElementById('passwordModalTitle');
     const inputEl    = document.getElementById('notePasswordInput');
     const errorEl    = document.getElementById('passwordError');
@@ -575,52 +725,57 @@ function _deleteNoteWithPassword(id, action, errorMsg) {
 
     titleEl.textContent = '🔒 Nhập mật khẩu để xác nhận xóa';
     inputEl.value = '';
-
-    if (errorMsg) { errorEl.textContent = errorMsg; errorEl.style.display = 'block'; }
-    else          { errorEl.style.display = 'none'; }
+    errorEl.style.display = 'none';
 
     const newBtn = confirmBtn.cloneNode(true);
     confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
 
     newBtn.onclick = function () {
         const pw = inputEl.value.trim();
-        if (!pw) { errorEl.textContent = 'Vui lòng nhập mật khẩu!'; errorEl.style.display = 'block'; inputEl.focus(); return; }
+        if (!pw) {
+            errorEl.textContent = 'Vui lòng nhập mật khẩu!';
+            errorEl.style.display = 'block';
+            inputEl.focus();
+            return;
+        }
+
         newBtn.disabled = true;
         newBtn.textContent = 'Đang xác nhận...';
         errorEl.style.display = 'none';
 
-        fetch('api/delete_note.php', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ id, action, delete_password: pw }).toString()
-        })
-        .then(res => res.json())
-        .then(d => {
-            if (d.success) {
-                _restorePasswordModal(newBtn);
-                passwordModalInstance.hide();
-                closeAndReload();
-            } else {
-                errorEl.textContent = d.message || 'Mật khẩu không đúng!';
+        const fd = new FormData();
+        fd.append('id', id);
+        fd.append('action', action);
+        fd.append('delete_password', pw);
+        fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
+
+        fetch('api/delete_note.php', { method: 'POST', body: fd })
+            .then(res => res.json())
+            .then(d => {
+                if (d.success) {
+                    showToast(d.message || 'Đã xóa thành công', 'success');
+                    passwordModalInstance.hide();
+                    closeAndReload();
+                } else {
+                    errorEl.textContent = d.message || 'Mật khẩu không đúng!';
+                    errorEl.style.display = 'block';
+                    inputEl.value = '';
+                    inputEl.focus();
+                    newBtn.disabled = false;
+                    newBtn.textContent = 'Xác nhận';
+                }
+            })
+            .catch(() => {
+                errorEl.textContent = 'Lỗi kết nối!';
                 errorEl.style.display = 'block';
-                inputEl.value = '';
-                inputEl.focus();
                 newBtn.disabled = false;
                 newBtn.textContent = 'Xác nhận';
-            }
-        })
-        .catch(() => {
-            errorEl.textContent = 'Lỗi kết nối, vui lòng thử lại!';
-            errorEl.style.display = 'block';
-            newBtn.disabled = false;
-            newBtn.textContent = 'Xác nhận';
-        });
+            });
     };
 
     passwordModalInstance.show();
-    setTimeout(() => inputEl.focus(), 500);
+    setTimeout(() => inputEl.focus(), 300);
 }
-
 function _restorePasswordModal(btn) {
     const restored = btn.cloneNode(true);
     restored.textContent = 'Xác nhận';
@@ -635,7 +790,10 @@ function restoreNote() {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: `id=${id}`
-    }).then(() => { alert('Khôi phục thành công!'); closeAndReload(); });
+    }).then(() => { 
+        showAlert('Khôi phục thành công!', 'success'); 
+        closeAndReload(); 
+    });
 }
 
 function renameLabel(id, currentName) {
@@ -683,30 +841,66 @@ function connectWebSocket() {
             }
 
             if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+
                 const titleEl   = document.getElementById('noteTitle');
                 const contentEl = document.getElementById('noteContent');
 
                 const isEditingTitle   = document.activeElement === titleEl;
                 const isEditingContent = document.activeElement === contentEl;
 
+                // =====================================================
+                // SYNC VERSION (FIX CONFLICT)
+                // =====================================================
+                if (data.version) {
+                    contentEl.dataset.version = data.version;
+                }
+
+                // =====================================================
+                // TITLE
+                // =====================================================
                 if (data.title !== undefined && !isEditingTitle) {
                     titleEl.value = data.title;
                 }
 
+                // =====================================================
+                // CONTENT
+                // =====================================================
                 if (data.content !== undefined) {
+
                     const currentContent  = contentEl.value || '';
                     const incomingContent = String(data.content);
 
                     if (!isEditingContent) {
+
+                        window.__remoteUpdating = true;
+
                         contentEl.value = incomingContent;
+
+                        window.__remoteUpdating = false;
+
                     } else {
-                        const isDeleting   = incomingContent.length < currentContent.length;
-                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                        const isDeleting =
+                            incomingContent.length < currentContent.length;
+
+                        const tooDifferent =
+                            Math.abs(
+                                incomingContent.length - currentContent.length
+                            ) > 5;
 
                         if (isDeleting || tooDifferent) {
+
                             const cursorPos = contentEl.selectionStart;
+
+                            window.__remoteUpdating = true;
+
                             contentEl.value = incomingContent;
-                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e) {}
+
+                            window.__remoteUpdating = false;
+
+                            try {
+                                contentEl.setSelectionRange(cursorPos, cursorPos);
+                            } catch (e) {}
                         }
                     }
                 }
@@ -748,7 +942,13 @@ function _startFallbackPolling() {
                 const titleEl   = document.getElementById('noteTitle');
                 const contentEl = document.getElementById('noteContent');
                 if (document.activeElement !== titleEl)   titleEl.value   = note.title   ?? '';
-                if (document.activeElement !== contentEl) contentEl.value = note.content ?? '';
+                if (document.activeElement !== contentEl) {
+                    contentEl.value = note.content ?? '';
+                }
+
+                if (note.version) {
+                    contentEl.dataset.version = note.version;
+                }
             })
             .catch(() => {});
     }, 4000);
@@ -866,18 +1066,31 @@ document.addEventListener('DOMContentLoaded', () => {
 // Realtime typing broadcast (80ms debounce)
 let realtimeTypingTimer = null;
 document.addEventListener('input', function (e) {
+
+    if (window.__remoteUpdating) return;
+
     if (!wsReady || !currentNoteIdForWS) return;
-    if (e.target.id !== 'noteTitle' && e.target.id !== 'noteContent') return;
+
+    if (
+        e.target.id !== 'noteTitle' &&
+        e.target.id !== 'noteContent'
+    ) return;
 
     clearTimeout(realtimeTypingTimer);
+
     realtimeTypingTimer = setTimeout(() => {
+
         _wsSend({
-            type:      'update',
-            note_id:   currentNoteIdForWS,
-            title:     document.getElementById('noteTitle').value || '',
-            content:   document.getElementById('noteContent').value || '',
+            type: 'update',
+            note_id: currentNoteIdForWS,
+            title: document.getElementById('noteTitle').value || '',
+            content: document.getElementById('noteContent').value || '',
+            version: parseInt(
+                document.getElementById('noteContent').dataset.version
+            ) || 1,
             user_name: currentUserName
         });
+
     }, 80);
 });
 
@@ -886,15 +1099,23 @@ function uploadImage() {
     const nid = document.getElementById('noteId').value;
     const f   = document.getElementById('imageInput').files[0];
     if (!f) return;
+
     const fd = new FormData();
     fd.append('image', f);
     fd.append('note_id', nid);
+
     fetch('api/upload_image.php', { method: 'POST', body: fd })
         .then(r => r.json())
         .then(d => {
-            if (d.success) renderImage(d.file_path, d.image_id, 'owner');
-            else alert(d.message);
+            if (d.success) {
+                renderImage(d.file_path, d.image_id, 'owner');
+            } else {
+                showAlert(d.message || 'Không thể upload ảnh', 'danger');
+            }
             document.getElementById('imageInput').value = '';
+        })
+        .catch(() => {
+            showAlert('Lỗi kết nối khi upload ảnh!', 'danger');
         });
 }
 
@@ -935,13 +1156,16 @@ function loadFilterLabels(callback) {
 function filterLabel(id) { currentLabelId = id; loadFilterLabels(() => liveSearch()); }
 
 function deleteLabel(id) {
-    if (confirm('Xóa nhãn?')) {
+    showConfirm('Xóa nhãn này?', () => {
         fetch('api/manage_labels.php?action=delete', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: `id=${id}`
-        }).then(() => { if (currentLabelId == id) currentLabelId = null; loadFilterLabels(() => liveSearch()); });
-    }
+        }).then(() => { 
+            if (currentLabelId == id) currentLabelId = null; 
+            loadFilterLabels(() => liveSearch()); 
+        });
+    });
 }
 
 function addNewLabel() {
@@ -1018,34 +1242,49 @@ function applyTheme(theme) {
 }
 
 function saveProfile() {
-    const fd        = new FormData();
-    const hasAvatar = document.getElementById('inputAvatar').files[0];
-    if (hasAvatar) fd.append('avatar', hasAvatar);
+    const fd = new FormData();
 
-    const fontSize  = document.getElementById('settingFontSize').value;
-    const theme     = document.getElementById('settingTheme').value;
-    const noteColor = document.getElementById('settingNoteColor').value;
+    const avatarFile = document.getElementById('inputAvatar').files[0];
+    if (avatarFile) fd.append('avatar', avatarFile);
+
+    const fontSize   = document.getElementById('settingFontSize').value;
+    const theme      = document.getElementById('settingTheme').value;
+    const noteColor  = document.getElementById('settingNoteColor').value;
+
     fd.append('font_size',   fontSize);
     fd.append('theme_color', theme);
     fd.append('note_color',  noteColor);
+    fd.append('csrf_token',  window.APP_CONFIG?.csrf_token || '');
 
+    // === PREVIEW NGAY LẬP TỨC ===
     applyTheme(theme);
+    
+    // Font size - Áp dụng mạnh
+    document.documentElement.style.fontSize = fontSize;
     document.body.style.fontSize = fontSize;
 
-    fetch('api/update_profile.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(data => {
-            if (data.success) {
-                if (hasAvatar) {
-                    location.reload();
-                } else {
-                    bootstrap.Modal.getInstance(document.getElementById('profileModal'))?.hide();
-                }
+    // Màu ghi chú mặc định
+    document.documentElement.style.setProperty('--note-default-color', noteColor);
+
+    fetch('api/update_profile.php', {
+        method: 'POST',
+        body: fd
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            if (avatarFile) {
+                location.reload();
             } else {
-                alert(data.message || 'Lỗi cập nhật!');
+                const modal = bootstrap.Modal.getInstance(document.getElementById('profileModal'));
+                if (modal) modal.hide();
+                showToast(' Đã lưu thay đổi thành công!', 'success');
             }
-        })
-        .catch(() => alert('Lỗi kết nối!'));
+        } else {
+            alert(data.message || 'Lỗi cập nhật!');
+        }
+    })
+    .catch(() => alert('Lỗi kết nối!'));
 }
 
 function togglePin(id, state) {
@@ -1058,22 +1297,38 @@ function togglePin(id, state) {
 
 function changeColor(color) {
     const id = document.getElementById('noteId').value;
-    if (!id) { alert('Vui lòng lưu ghi chú trước khi đổi màu!'); return; }
+    if (!id) {
+        showAlert('Vui lòng lưu ghi chú trước khi đổi màu!', 'warning');
+        return;
+    }
+
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('color', color || '');
+    fd.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
+
     fetch('api/change_color.php', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `id=${id}&color=${encodeURIComponent(color)}`
+        body: fd
     })
     .then(res => res.json())
     .then(d => {
         if (d.success) {
-            document.getElementById('modalContentWrapper').style.backgroundColor = color || 'var(--bs-body-bg)';
+            // Áp dụng ngay lập tức cho modal
+            const modalWrapper = document.getElementById('modalContentWrapper');
+            modalWrapper.style.backgroundColor = color || '';
+            modalWrapper.style.setProperty('--note-individual-color', color || '');
+            
             liveSearch();
+            showAlert('Đã đổi màu ghi chú thành công', 'success');
         } else {
-            alert('Không thể đổi màu ghi chú!');
+            showAlert('Không thể đổi màu ghi chú!', 'danger');
         }
     })
-    .catch(err => { console.error(err); alert('Lỗi kết nối khi đổi màu!'); });
+    .catch(err => {
+        console.error(err);
+        showAlert('Lỗi kết nối!', 'danger');
+    });
 }
 
 function formatRelativeTime(datetime) {
@@ -1086,46 +1341,148 @@ function formatRelativeTime(datetime) {
     return date.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short' });
 }
 
-// ====================== OFFLINE SUPPORT ======================
-let db;
+// ====================== OFFLINE SUPPORT - CẢI TIẾN ĐẦY ĐỦ ======================
+let db = null;
 
 function initIndexedDB() {
-    const request = indexedDB.open('NoteAppDB', 1);
+    const request = indexedDB.open('NoteAppDB', 2); // Tăng version để update schema nếu cần
 
     request.onupgradeneeded = function (event) {
         db = event.target.result;
         if (!db.objectStoreNames.contains('notes')) {
-            db.createObjectStore('notes', { keyPath: 'id' });
+            const store = db.createObjectStore('notes', { keyPath: 'id' });
+            store.createIndex('updated_at', 'updated_at');
         }
     };
 
     request.onsuccess = function (event) {
         db = event.target.result;
+        console.log('[IndexedDB] Database initialized successfully');
     };
 
     request.onerror = function (event) {
-        console.error('IndexedDB error:', event.target.error);
+        console.error('[IndexedDB] Error:', event.target.error);
     };
 }
 
+// Lưu note vào IndexedDB khi offline
 function saveNoteOffline(note) {
-    if (!db) return;
-    db.transaction(['notes'], 'readwrite').objectStore('notes').put(note);
+    if (!db || !note.id) return;
+    const transaction = db.transaction(['notes'], 'readwrite');
+    const store = transaction.objectStore('notes');
+    store.put(note);
+    console.log(`[Offline] Saved note ${note.id} to IndexedDB`);
 }
 
+// Đồng bộ khi online
 function syncOfflineNotes() {
     if (!navigator.onLine || !db) return;
-    const store   = db.transaction(['notes'], 'readonly').objectStore('notes');
+
+    const transaction = db.transaction(['notes'], 'readonly');
+    const store = transaction.objectStore('notes');
     const request = store.getAll();
 
     request.onsuccess = function () {
-        request.result.forEach(note => {
+        const offlineNotes = request.result;
+        if (offlineNotes.length === 0) return;
+
+        console.log(`[Offline] Found ${offlineNotes.length} notes to sync`);
+
+        let syncedCount = 0;
+        offlineNotes.forEach(note => {
+            const fd = new FormData();
+            fd.append('id', note.id);
+            fd.append('title', note.title || '');
+            fd.append('content', note.content || '');
+            fd.append('version', note.version || 1);
+            fd.append('csrf_token', window.APP_CONFIG.csrf_token || '');
+
             fetch('api/save_note.php', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: `id=${note.id}&title=${encodeURIComponent(note.title)}&content=${encodeURIComponent(note.content)}`
-            });
+                body: fd
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    syncedCount++;
+                    // Xóa khỏi IndexedDB sau khi sync thành công
+                    const delTrans = db.transaction(['notes'], 'readwrite');
+                    delTrans.objectStore('notes').delete(note.id);
+                }
+            })
+            .catch(err => console.error('Sync failed for note', note.id, err));
         });
-        db.transaction(['notes'], 'readwrite').objectStore('notes').clear();
+
+        if (syncedCount > 0) {
+            showToast(`Đã đồng bộ ${syncedCount} ghi chú từ chế độ offline`, 'success');
+            setTimeout(liveSearch, 1000);
+        }
     };
+}
+
+// ====================== TOAST NOTIFICATION ======================
+function showToast(message, type = 'success') {
+    const toast = document.createElement('div');
+    toast.className = `toast align-items-center text-bg-${type === 'success' ? 'success' : type === 'warning' ? 'warning' : 'danger'} border-0 position-fixed bottom-0 end-0 m-3`;
+    toast.style.zIndex = '9999';
+    toast.innerHTML = `
+        <div class="d-flex">
+            <div class="toast-body">
+                ${type === 'success' ? '✅' : type === 'warning' ? '⚠️' : '❌'} ${message}
+            </div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+        </div>
+    `;
+    document.body.appendChild(toast);
+    const bsToast = new bootstrap.Toast(toast, { delay: 2500 });
+    bsToast.show();
+    setTimeout(() => toast.remove(), 2800);
+}
+// ====================== CUSTOM MODAL (Thay thế localhost says) ======================
+const customAlertModal = new bootstrap.Modal(document.getElementById('customAlertModal'));
+const customConfirmModal = new bootstrap.Modal(document.getElementById('customConfirmModal'));
+
+function showAlert(message, type = 'info') {
+    const titleEl = document.getElementById('customAlertTitle');
+    const bodyEl  = document.getElementById('customAlertBody');
+    const btnEl   = document.getElementById('customAlertBtn');
+
+    if (type === 'success') {
+        titleEl.innerHTML = `<i class="bi bi-check-circle-fill text-success"></i> Thành công`;
+        btnEl.className = 'btn btn-success px-4';
+    } else if (type === 'danger' || type === 'error') {
+        titleEl.innerHTML = `<i class="bi bi-x-circle-fill text-danger"></i> Lỗi`;
+        btnEl.className = 'btn btn-danger px-4';
+    } else if (type === 'warning') {
+        titleEl.innerHTML = `<i class="bi bi-exclamation-triangle-fill text-warning"></i> Cảnh báo`;
+        btnEl.className = 'btn btn-warning px-4';
+    } else {
+        titleEl.innerHTML = `<i class="bi bi-info-circle"></i> Thông báo`;
+        btnEl.className = 'btn btn-primary px-4';
+    }
+
+    bodyEl.innerHTML = `<p class="mb-0">${message}</p>`;
+    customAlertModal.show();
+}
+
+function showConfirm(message, onConfirm, onCancel = null) {
+    document.getElementById('customConfirmBody').innerHTML = `<p>${message}</p>`;
+
+    const okBtn = document.getElementById('confirmOkBtn');
+    const cancelBtn = document.getElementById('confirmCancelBtn');
+
+    okBtn.replaceWith(okBtn.cloneNode(true));
+    cancelBtn.replaceWith(cancelBtn.cloneNode(true));
+
+    document.getElementById('confirmOkBtn').onclick = () => {
+        customConfirmModal.hide();
+        if (onConfirm) onConfirm();
+    };
+
+    document.getElementById('confirmCancelBtn').onclick = () => {
+        customConfirmModal.hide();
+        if (onCancel) onCancel();
+    };
+
+    customConfirmModal.show();
 }

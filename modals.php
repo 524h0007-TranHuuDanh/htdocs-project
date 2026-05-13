@@ -154,3 +154,55 @@
         </div>
     </div>
 </div>
+<!-- Modal Xác nhận Xóa -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title text-danger" id="deleteModalTitle">
+                    <i class="bi bi-trash3"></i> Xác nhận xóa
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="deleteModalBody">
+                <!-- Nội dung sẽ được thay đổi bằng JS -->
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+                <button type="button" class="btn btn-danger" id="confirmDeleteBtn">Xác nhận</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- ==================== CUSTOM ALERT / CONFIRM MODAL ==================== -->
+<div class="modal fade" id="customAlertModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title" id="customAlertTitle">Thông báo</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-center py-4" id="customAlertBody"></div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-primary px-4" id="customAlertBtn" data-bs-dismiss="modal">OK</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="customConfirmModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title text-warning" id="customConfirmTitle">Xác nhận</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="customConfirmBody"></div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" id="confirmCancelBtn">Hủy</button>
+                <button type="button" class="btn btn-danger" id="confirmOkBtn">Xác nhận</button>
+            </div>
+        </div>
+    </div>
+</div>
+

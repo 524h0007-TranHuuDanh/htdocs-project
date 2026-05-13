@@ -6,18 +6,33 @@ $message = '';
 $token = $_GET['token'] ?? '';
 
 if (!empty($token)) {
-    $stmt = $pdo->prepare("SELECT id, display_name FROM users WHERE activation_token = ? LIMIT 1");
+    $stmt = $pdo->prepare("
+        SELECT id, display_name 
+        FROM users 
+        WHERE activation_token = ? 
+          AND activation_expiry > NOW() 
+          AND is_activated = 0 
+        LIMIT 1
+    ");
     $stmt->execute([$token]);
     $user = $stmt->fetch();
 
     if ($user) {
-        $update = $pdo->prepare("UPDATE users SET is_activated = 1, activation_token = NULL WHERE id = ?");
+        $update = $pdo->prepare("
+            UPDATE users 
+            SET is_activated = 1, 
+                activation_token = NULL, 
+                activation_expiry = NULL,
+                email_verified_at = NOW()
+            WHERE id = ?
+        ");
         $update->execute([$user['id']]);
 
-        // Tự động đăng nhập sau khi kích hoạt
         $_SESSION['user_id']      = $user['id'];
         $_SESSION['display_name'] = $user['display_name'];
         $_SESSION['is_activated'] = 1;
+
+        session_regenerate_id(true);
 
         $message = "Kích hoạt tài khoản thành công!";
         header("Location: index.php?activated=1");
