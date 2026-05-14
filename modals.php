@@ -86,50 +86,20 @@
     </div>
 </div>
 
-<!-- Modal Profile -->
-<div class="modal fade" id="profileModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content shadow">
-            <div class="modal-header">
-                <h5 class="modal-title fw-bold"><i class="bi bi-gear"></i> Cài đặt tài khoản</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+<!-- Modal Profile MỚI (thay thế hoàn toàn) -->
+<div class="modal fade" id="profileModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered modal-md">
+        <div class="modal-content shadow-lg" id="profileModalContent">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold" id="profileModalTitle">
+                    <i class="bi bi-person-circle"></i> Tài khoản
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
-            <div class="modal-body text-center">
-                <img id="previewAvatar" src="<?= htmlspecialchars($user_avatar) ?>" class="rounded-circle mb-3 border" style="width:120px;height:120px;object-fit:cover;">
-                <div class="mb-4">
-                    <label class="btn btn-outline-primary btn-sm rounded-pill px-3">
-                        <i class="bi bi-camera"></i> Đổi ảnh đại diện
-                        <input type="file" id="inputAvatar" hidden accept="image/*" onchange="previewImage(this)">
-                    </label>
+            <div class="modal-body p-4" id="profileModalBody">
+                <div class="text-center py-4">
+                    <div class="spinner-border text-primary" role="status"></div>
                 </div>
-                <hr>
-                <div class="row text-start g-3 mt-2">
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Kích thước chữ</label>
-                        <select id="settingFontSize" class="form-select">
-                            <option value="14px">Nhỏ</option>
-                            <option value="16px" selected>Vừa</option>
-                            <option value="18px">Lớn</option>
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Giao diện</label>
-                        <select id="settingTheme" class="form-select">
-                            <option value="light">Sáng</option>
-                            <option value="dark">Tối</option>
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Màu ghi chú</label>
-                        <input type="color" id="settingNoteColor" class="form-control form-control-color w-100" value="<?= htmlspecialchars($user_note_color) ?>">
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer bg-body-tertiary">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
-                <button type="button" class="btn btn-success px-4" onclick="saveProfile()">
-                    <i class="bi bi-check2"></i> Lưu thay đổi
-                </button>
             </div>
         </div>
     </div>
@@ -206,3 +176,34 @@
     </div>
 </div>
 
+<!-- Modal Bulk Share -->
+<div class="modal fade" id="bulkShareModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold"><i class="bi bi-share-fill"></i> Chia sẻ nhiều ghi chú</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Email người nhận (cách nhau bằng dấu phẩy)</label>
+                    <input type="text" id="bulkShareEmails" class="form-control" placeholder="user1@example.com, user2@example.com">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Quyền truy cập</label>
+                    <select id="bulkSharePermission" class="form-select">
+                        <option value="read">Chỉ xem</option>
+                        <option value="edit">Cho phép chỉnh sửa</option>
+                    </select>
+                </div>
+                <div class="alert alert-info small">
+                    <i class="bi bi-info-circle"></i> Ghi chú sẽ được chia sẻ đến tất cả email trên, với quyền được chọn.
+                </div>
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+                <button type="button" class="btn btn-primary" id="bulkShareConfirmBtn">Xác nhận chia sẻ</button>
+            </div>
+        </div>
+    </div>
+</div>

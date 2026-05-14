@@ -18,6 +18,10 @@ let autoSaveBusyTimer      = null;
 let autoSaveInFlightSeq    = 0;
 let lastAutoSavePersistSig = '';
 let isSaving               = false;
+let bulkMode = false;
+let bulkShareModal = null;
+let selectedNotes = new Set(); // lưu id
+let currentNotesList = []; // lưu danh sách note hiện tại để kiểm tra khóa
 /** Coalesces list refresh after rapid autosaves (single search request). */
 let liveSearchAfterSaveTimer = null;
 /** True while applying server title/content+version after HTTP conflict; blocks autosave to avoid stale POSTs. */
@@ -35,6 +39,8 @@ const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+let profileSubScreen    = null; // Biến mới cho profile
+
 function resetPasswordModalToDefault() {
     const modal = document.getElementById('passwordModal');
     if (!modal) return;
@@ -107,6 +113,7 @@ function setNoteOwnerToolbarVisible(visible) {
 
 // ====================== DOM READY (một handler duy nhất) ======================
 document.addEventListener('DOMContentLoaded', () => {
+    bulkShareModal = new bootstrap.Modal(document.getElementById('bulkShareModal'));
     // --- Modals Bootstrap ---
     noteModal          = new bootstrap.Modal(document.getElementById('noteModal'));
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
@@ -132,21 +139,8 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(loadNotesOfflineFallback, 800);
     }
 
-    // --- Theme preview ---
-    const themeSelect = document.getElementById('settingTheme');
-    if (themeSelect) {
-        themeSelect.addEventListener('change', function () {
-            applyTheme(this.value);
-        });
-    }
-
-    // --- Font size preview ---
-    const fontSelect = document.getElementById('settingFontSize');
-    if (fontSelect) {
-        fontSelect.addEventListener('change', function () {
-            document.body.style.fontSize = this.value;
-        });
-    }
+    // --- Theme preview (đã được thay bằng profile mới, giữ lại applyTheme) ---
+    // Không còn themeSelect, fontSelect cũ vì đã chuyển vào profile
 
     // --- Force sync content khi blur khỏi noteContent ---
     const noteContentEl = document.getElementById('noteContent');
@@ -174,10 +168,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (savedNoteColor) {
         document.documentElement.style.setProperty('--note-default-color', savedNoteColor);
     }
-    // Lưu lại khi người dùng thay đổi trong profile
-    document.getElementById('settingNoteColor')?.addEventListener('change', function() {
-        localStorage.setItem('noteapp_note_color', this.value);
-    });
+    // Lưu lại khi người dùng thay đổi trong profile (sẽ được xử lý qua savePreferences)
+        // Bulk selection buttons
+    const toggleBtn = document.getElementById('toggleBulkModeBtn');
+    if (toggleBtn) toggleBtn.addEventListener('click', toggleBulkMode);
+    
+    const bulkDelete = document.getElementById('bulkDeleteBtn');
+    const bulkRestore = document.getElementById('bulkRestoreBtn');
+    const bulkPermanent = document.getElementById('bulkPermanentBtn');
+    const bulkShare = document.getElementById('bulkShareBtn');
+    const bulkCancel = document.getElementById('bulkCancelBtn');
+    
+    if (bulkDelete) bulkDelete.addEventListener('click', () => bulkAction('trash'));
+    if (bulkRestore) bulkRestore.addEventListener('click', () => bulkAction('restore'));
+    if (bulkPermanent) bulkPermanent.addEventListener('click', () => bulkAction('permanent'));
+    if (bulkShare) bulkShare.addEventListener('click', () => bulkAction('share'));
+    if (bulkCancel) bulkCancel.addEventListener('click', toggleBulkMode);
 });
 
 // ====================== REALTIME TYPING BROADCAST (80ms debounce) ======================
@@ -202,6 +208,7 @@ function setViewMode(mode) {
 
     setTimeout(() => {
         currentViewMode = mode;
+        if (bulkMode) toggleBulkMode();
         currentLabelId  = null;
 
         document.getElementById('btnViewShared').style.display  = mode === 'shared'   ? 'none' : 'block';
@@ -338,7 +345,18 @@ function renderNotes(notes) {
             body.dataset.permission,
             body.dataset.ownerName
         ));
-
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'bulk-checkbox';
+        checkbox.dataset.id = n.id;
+        checkbox.disabled = (n.is_locked == 1); // nếu có mật khẩu
+        checkbox.addEventListener('change', (e) => {
+            e.stopPropagation();
+            if (checkbox.checked) selectedNotes.add(n.id);
+            else selectedNotes.delete(n.id);
+            updateBulkToolbar();
+        });
+        card.appendChild(checkbox);
         body.innerHTML = `
             ${currentViewMode === 'my_notes'
                 ? `<button class="btn btn-sm position-absolute top-0 end-0 m-2 border-0"
@@ -359,7 +377,134 @@ function renderNotes(notes) {
         container.appendChild(card);
     });
 }
+// ====================== BULK SELECTION ======================
+function updateBulkToolbar() {
+    const count = selectedNotes.size;
+    const counter = document.getElementById('bulkCounter');
+    if (counter) counter.innerText = count;
+    
+    const isTrash = (currentViewMode === 'trash');
+    const deleteBtn = document.getElementById('bulkDeleteBtn');
+    const restoreBtn = document.getElementById('bulkRestoreBtn');
+    const permanentBtn = document.getElementById('bulkPermanentBtn');
+    const shareBtn = document.getElementById('bulkShareBtn');
+    
+    if (deleteBtn) deleteBtn.style.display = isTrash ? 'none' : 'inline-flex';
+    if (restoreBtn) restoreBtn.style.display = isTrash ? 'inline-flex' : 'none';
+    if (permanentBtn) permanentBtn.style.display = isTrash ? 'inline-flex' : 'none';
+    if (shareBtn) shareBtn.style.display = (currentViewMode === 'my_notes' && !isTrash) ? 'inline-flex' : 'none';
+}
 
+function toggleBulkMode() {
+    bulkMode = !bulkMode;
+    const container = document.getElementById('notesContainer');
+    const toolbar = document.getElementById('bulkToolbar');
+    const toggleBtn = document.getElementById('toggleBulkModeBtn');
+    
+    if (bulkMode) {
+        container.classList.add('bulk-mode');
+        toolbar.classList.remove('d-none');
+        toggleBtn.classList.add('active');
+        selectedNotes.clear();
+        updateBulkToolbar();
+    } else {
+        container.classList.remove('bulk-mode');
+        toolbar.classList.add('d-none');
+        toggleBtn.classList.remove('active');
+        // Bỏ chọn tất cả checkbox
+        document.querySelectorAll('.bulk-checkbox').forEach(cb => {
+            cb.checked = false;
+        });
+        selectedNotes.clear();
+    }
+}
+
+async function bulkAction(action) {
+    if (selectedNotes.size === 0) {
+        showToast('Chưa chọn ghi chú nào', 'warning');
+        return;
+    }
+    
+    if (action === 'share') {
+        // Hiển thị modal nhập email và quyền
+        document.getElementById('bulkShareEmails').value = '';
+        document.getElementById('bulkSharePermission').value = 'read';
+        bulkShareModal.show();
+        
+        // Xử lý khi nhấn nút xác nhận
+        const confirmBtn = document.getElementById('bulkShareConfirmBtn');
+        const oldHandler = confirmBtn.onclick;
+        confirmBtn.onclick = async () => {
+            const emails = document.getElementById('bulkShareEmails').value.trim();
+            const permission = document.getElementById('bulkSharePermission').value;
+            if (!emails) {
+                showToast('Vui lòng nhập email', 'warning');
+                return;
+            }
+            bulkShareModal.hide();
+            await executeBulkShare(emails, permission);
+        };
+        return;
+    }
+    
+    // Các action khác (trash, restore, permanent) dùng confirm cũ
+    let confirmMsg = '';
+    if (action === 'trash') {
+        confirmMsg = `Bạn có chắc muốn chuyển ${selectedNotes.size} ghi chú vào thùng rác?`;
+    } else if (action === 'restore') {
+        confirmMsg = `Khôi phục ${selectedNotes.size} ghi chú?`;
+    } else if (action === 'permanent') {
+        confirmMsg = `Xóa vĩnh viễn ${selectedNotes.size} ghi chú? Hành động này không thể hoàn tác.`;
+    } else {
+        return;
+    }
+    
+    showConfirm(confirmMsg, () => executeBulkAction(action));
+}
+
+async function executeBulkShare(emails, permission) {
+    const fd = new FormData();
+    fd.append('action', 'share');
+    fd.append('ids', Array.from(selectedNotes).join(','));
+    fd.append('emails', emails);
+    fd.append('permission', permission);
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/bulk_action.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message, 'success');
+            toggleBulkMode();
+            liveSearch();
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
+
+async function executeBulkAction(action) {
+    const fd = new FormData();
+    fd.append('action', action);
+    fd.append('ids', Array.from(selectedNotes).join(','));
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/bulk_action.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message, 'success');
+            toggleBulkMode();
+            liveSearch();
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
 // ====================== MỞ GHI CHÚ & PASSWORD ======================
 function handleNoteOpen(id, title, content, isLocked, color, permission, ownerName) {
     // Kiểm tra modal tồn tại
@@ -594,8 +739,6 @@ function closeAndReload() {
 }
 
 // ====================== AUTO SAVE ======================
-// Tích hợp: offline fallback + WebSocket broadcast + xử lý conflict
-// =========================================================
 function _autoSavePayloadSignature() {
     const noteId  = document.getElementById('noteId').value;
     const title   = document.getElementById('noteTitle').value.trim();
@@ -709,7 +852,6 @@ function autoSave() {
                         noteConflictResolutionLock = true;
                         window.__remoteUpdating = true;
                         try {
-                            // Apply server fields first; only then bump version (never version without synced title+body).
                             if (hasLatestTitle) {
                                 titleEl.value = d.latest_title;
                             }
@@ -1013,7 +1155,6 @@ function _openPasswordModal(config) {
                 .then(shouldClose => {
                     if (shouldClose === true) {
                         passwordModalInstance.hide();
-                        // Reset modal password về dạng nhập mật khẩu mở note
                         resetPasswordModalToDefault();
                         liveSearch();
                     }
@@ -1022,7 +1163,6 @@ function _openPasswordModal(config) {
         });
     });
 
-    // Khi modal bị đóng bằng nút Hủy hoặc dấu X, cũng reset lại
     const modalEl = document.getElementById('passwordModal');
     const onHidden = () => {
         resetPasswordModalToDefault();
@@ -1223,135 +1363,133 @@ function connectWebSocket() {
                 _setWsStatus('connecting');
             };
 
-       socket.onmessage = (event) => {
-    if (ws !== socket) return;
-    try {
-        const data = JSON.parse(event.data);
+            socket.onmessage = (event) => {
+                if (ws !== socket) return;
+                try {
+                    const data = JSON.parse(event.data);
 
-        if (data.type === 'auth_error') {
-            wsReady = false;
-            _setWsStatus('offline');
-            try { socket.close(); } catch (e2) {}
-            return;
-        }
-
-        if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
-            console.warn('[WS] join_denied:', data.message || '');
-            return;
-        }
-
-        if (data.type === 'auth_success') {
-            wsReady = true;
-            _setWsStatus('online');
-            if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
-        }
-
-        if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-            if (data.user_name === currentUserName) return;
-
-            const contentElPre = document.getElementById('noteContent');
-            const incomingVer = data.version != null && data.version !== ''
-                ? parseInt(data.version, 10)
-                : NaN;
-            const rawLocal = contentElPre && contentElPre.dataset.version;
-            const localVer = rawLocal !== undefined && rawLocal !== ''
-                ? parseInt(rawLocal, 10)
-                : NaN;
-            if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
-                return;
-            }
-
-            const c = String(data.content ?? '');
-            const inboundKey = [
-                data.note_id,
-                data.user_name,
-                data.timestamp ?? '',
-                data.title ?? '',
-                c.length,
-                c.slice(0, 256)
-            ].join('\x1e');
-            if (inboundKey === _lastWsInboundKey) return;
-            _lastWsInboundKey = inboundKey;
-
-            const titleEl   = document.getElementById('noteTitle');
-            const contentEl = document.getElementById('noteContent');
-
-            const isEditingTitle   = document.activeElement === titleEl;
-            const isEditingContent = document.activeElement === contentEl;
-
-            window.__remoteUpdating = true;
-            try {
-                if (data.version != null && data.version !== '') {
-                    contentEl.dataset.version = String(data.version);
-                }
-
-                if (data.title !== undefined && !isEditingTitle) {
-                    titleEl.value = data.title;
-                }
-
-                if (data.content !== undefined) {
-                    const currentContent  = contentEl.value    || '';
-                    const incomingContent = String(data.content);
-
-                    if (!isEditingContent) {
-                        contentEl.value = incomingContent;
-                    } else {
-                        const isDeleting   = incomingContent.length < currentContent.length;
-                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                        if (isDeleting || tooDifferent) {
-                            const cursorPos = contentEl.selectionStart;
-                            contentEl.value = incomingContent;
-                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
-                        }
+                    if (data.type === 'auth_error') {
+                        wsReady = false;
+                        _setWsStatus('offline');
+                        try { socket.close(); } catch (e2) {}
+                        return;
                     }
+
+                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+                        console.warn('[WS] join_denied:', data.message || '');
+                        return;
+                    }
+
+                    if (data.type === 'auth_success') {
+                        wsReady = true;
+                        _setWsStatus('online');
+                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+                    }
+
+                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+                        if (data.user_name === currentUserName) return;
+
+                        const contentElPre = document.getElementById('noteContent');
+                        const incomingVer = data.version != null && data.version !== ''
+                            ? parseInt(data.version, 10)
+                            : NaN;
+                        const rawLocal = contentElPre && contentElPre.dataset.version;
+                        const localVer = rawLocal !== undefined && rawLocal !== ''
+                            ? parseInt(rawLocal, 10)
+                            : NaN;
+                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                            return;
+                        }
+
+                        const c = String(data.content ?? '');
+                        const inboundKey = [
+                            data.note_id,
+                            data.user_name,
+                            data.timestamp ?? '',
+                            data.title ?? '',
+                            c.length,
+                            c.slice(0, 256)
+                        ].join('\x1e');
+                        if (inboundKey === _lastWsInboundKey) return;
+                        _lastWsInboundKey = inboundKey;
+
+                        const titleEl   = document.getElementById('noteTitle');
+                        const contentEl = document.getElementById('noteContent');
+
+                        const isEditingTitle   = document.activeElement === titleEl;
+                        const isEditingContent = document.activeElement === contentEl;
+
+                        window.__remoteUpdating = true;
+                        try {
+                            if (data.version != null && data.version !== '') {
+                                contentEl.dataset.version = String(data.version);
+                            }
+
+                            if (data.title !== undefined && !isEditingTitle) {
+                                titleEl.value = data.title;
+                            }
+
+                            if (data.content !== undefined) {
+                                const currentContent  = contentEl.value    || '';
+                                const incomingContent = String(data.content);
+
+                                if (!isEditingContent) {
+                                    contentEl.value = incomingContent;
+                                } else {
+                                    const isDeleting   = incomingContent.length < currentContent.length;
+                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                                    if (isDeleting || tooDifferent) {
+                                        const cursorPos = contentEl.selectionStart;
+                                        contentEl.value = incomingContent;
+                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                                    }
+                                }
+                            }
+                        } finally {
+                            window.__remoteUpdating = false;
+                        }
+
+                        _showTypingIndicator(data.user_name);
+                    }
+
+                    // ========== XỬ LÝ MÀU SẮC ==========
+                    if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
+                        const modalWrapper = document.getElementById('modalContentWrapper');
+                        if (modalWrapper) {
+                            modalWrapper.style.backgroundColor = data.color;
+                            modalWrapper.style.setProperty('--note-individual-color', data.color);
+                        }
+                        const cards = document.querySelectorAll('.note-card');
+                        cards.forEach(card => {
+                            const body = card.querySelector('.card-body');
+                            if (body && body.dataset.id == data.note_id) {
+                                card.style.backgroundColor = data.color;
+                            }
+                        });
+                        _showTypingIndicator(data.user_name + ' đã đổi màu');
+                    }
+
+                    // ========== XỬ LÝ THÊM ẢNH ==========
+                    if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
+                        renderImage(data.file_path, data.image_id, currentPermission);
+                        _showTypingIndicator(data.user_name + ' đã thêm ảnh');
+                    }
+
+                    // ========== XỬ LÝ XÓA ẢNH ==========
+                    if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
+                        const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
+                        if (imgDiv) imgDiv.remove();
+                        _showTypingIndicator(data.user_name + ' đã xóa ảnh');
+                    }
+
+                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+                        _renderPresence(data.users);
+                    }
+                } catch (e) {
+                    console.error('WS parse error:', e);
                 }
-            } finally {
-                window.__remoteUpdating = false;
-            }
-
-            _showTypingIndicator(data.user_name);
-        }
-
-        // ========== XỬ LÝ MÀU SẮC ==========
-        if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
-            const modalWrapper = document.getElementById('modalContentWrapper');
-            if (modalWrapper) {
-                modalWrapper.style.backgroundColor = data.color;
-                modalWrapper.style.setProperty('--note-individual-color', data.color);
-            }
-            // Cập nhật card trong danh sách nếu có
-            const cards = document.querySelectorAll('.note-card');
-            cards.forEach(card => {
-                const body = card.querySelector('.card-body');
-                if (body && body.dataset.id == data.note_id) {
-                    card.style.backgroundColor = data.color;
-                }
-            });
-            _showTypingIndicator(data.user_name + ' đã đổi màu');
-        }
-
-        // ========== XỬ LÝ THÊM ẢNH ==========
-        if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
-            // Gọi hàm renderImage với permission hiện tại
-            renderImage(data.file_path, data.image_id, currentPermission);
-            _showTypingIndicator(data.user_name + ' đã thêm ảnh');
-        }
-
-        // ========== XỬ LÝ XÓA ẢNH ==========
-        if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
-            const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
-            if (imgDiv) imgDiv.remove();
-            _showTypingIndicator(data.user_name + ' đã xóa ảnh');
-        }
-
-        if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-            _renderPresence(data.users);
-        }
-    } catch (e) {
-        console.error('WS parse error:', e);
-    }
-};
+            };
 
             socket.onclose = () => {
                 if (ws !== socket) return;
@@ -1491,7 +1629,6 @@ function uploadImage() {
         .then(d => {
             if (d.success) {
                 renderImage(d.file_path, d.image_id, 'owner');
-                // Broadcast image added
                 if (wsReady && currentNoteIdForWS == nid) {
                     _wsSend({
                         type: 'image_added',
@@ -1531,7 +1668,6 @@ function deleteImage(id, btn) {
             if (d.success) {
                 const imgDiv = btn.closest('[data-image-id]');
                 if (imgDiv) imgDiv.remove();
-                // Broadcast image deleted
                 if (wsReady && currentNoteIdForWS) {
                     _wsSend({
                         type: 'image_deleted',
@@ -1650,68 +1786,311 @@ function removeLabel(nid, lid) {
     }).then(() => { loadLabelsForNote(nid); liveSearch(); });
 }
 
-// ====================== PROFILE / SETTINGS ======================
-function saveProfile() {
-    const fd = new FormData();
-
-    const avatarFile = document.getElementById('inputAvatar').files[0];
-    if (avatarFile) fd.append('avatar', avatarFile);
-
-    const fontSize = document.getElementById('settingFontSize').value;
-    const theme = document.getElementById('settingTheme').value;
-    const noteColor = document.getElementById('settingNoteColor').value;
-
-    fd.append('font_size', fontSize);
-    fd.append('theme_color', theme);
-    fd.append('note_color', noteColor);
-    appendCsrfToken(fd);
-
-    // Áp dụng ngay lập tức cho giao diện
-    applyTheme(theme);
-    document.documentElement.style.fontSize = fontSize;
-    document.body.style.fontSize = fontSize;
-    document.documentElement.style.setProperty('--note-default-color', noteColor);
-    // Cập nhật màu cho tất cả các note card hiện tại (nếu không có màu riêng)
-    document.querySelectorAll('.note-card').forEach(card => {
-        if (!card.style.backgroundColor) {
-            card.style.backgroundColor = noteColor;
-        }
-    });
-
-    fetch('api/update_profile.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(data => {
-            if (data.success) {
-                if (avatarFile) {
-                    location.reload();
-                } else {
-                    const modal = bootstrap.Modal.getInstance(document.getElementById('profileModal'));
-                    if (modal) modal.hide();
-                    showToast('Đã lưu thay đổi thành công!', 'success');
-                }
-            } else {
-                showAlert(data.message || 'Lỗi cập nhật!', 'danger');
-            }
-        })
-        .catch(() => showAlert('Lỗi kết nối!', 'danger'));
+// ====================== PROFILE / SETTINGS (MỚI) ======================
+function showProfileModal() {
+    profileSubScreen = 'main';
+    renderProfileScreen();
+    const modal = new bootstrap.Modal(document.getElementById('profileModal'));
+    modal.show();
 }
 
-function previewImage(input) {
+function renderProfileScreen() {
+    const titleEl = document.getElementById('profileModalTitle');
+    const bodyEl = document.getElementById('profileModalBody');
+    const cfg = window.APP_CONFIG || {};
+
+    if (profileSubScreen === 'main') {
+        titleEl.innerHTML = '<i class="bi bi-person-circle"></i> Tài khoản & Tùy chỉnh';
+        bodyEl.innerHTML = `
+            <div class="d-grid gap-3">
+                <button class="btn btn-outline-primary btn-lg py-3" onclick="profileGoTo('account')">
+                    <i class="bi bi-gear-wide-connected fs-4 me-2"></i> Cài đặt tài khoản
+                </button>
+                <button class="btn btn-outline-secondary btn-lg py-3" onclick="profileGoTo('preferences')">
+                    <i class="bi bi-palette fs-4 me-2"></i> Tùy chỉnh ghi chú
+                </button>
+            </div>
+            <div class="mt-4 text-center">
+                <img src="${escapeHtml(cfg.avatar || 'uploads/avatars/default-avatar.png')}" 
+                     class="rounded-circle border shadow-sm" style="width:64px;height:64px;object-fit:cover;">
+                <div class="mt-2">
+                    <strong>${escapeHtml(cfg.displayName || 'Người dùng')}</strong><br>
+                    <small class="text-muted">${escapeHtml(cfg.email || '')}</small>
+                </div>
+            </div>
+        `;
+    } 
+    else if (profileSubScreen === 'account') {
+        titleEl.innerHTML = '<i class="bi bi-arrow-left me-2" style="cursor:pointer;" onclick="profileGoTo(\'main\')"></i> Cài đặt tài khoản';
+        bodyEl.innerHTML = `
+            <form id="accountSettingsForm">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Email</label>
+                    <input type="email" class="form-control" value="${escapeHtml(cfg.email || '')}" readonly disabled>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Tên hiển thị</label>
+                    <input type="text" id="displayNameInput" class="form-control" value="${escapeHtml(cfg.displayName || '')}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Đổi mật khẩu</label>
+                    <input type="password" id="oldPassword" class="form-control mb-2" placeholder="Mật khẩu hiện tại">
+                    <input type="password" id="newPassword" class="form-control mb-2" placeholder="Mật khẩu mới (≥6 ký tự)">
+                    <input type="password" id="confirmPassword" class="form-control" placeholder="Xác nhận mật khẩu mới">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Ảnh đại diện</label>
+                    <div class="d-flex align-items-center gap-3">
+                        <img id="previewAvatarAccount" src="${escapeHtml(cfg.avatar || 'uploads/avatars/default-avatar.png')}" 
+                             style="width:60px;height:60px;object-fit:cover;border-radius:50%;">
+                        <label class="btn btn-sm btn-outline-primary">
+                            <i class="bi bi-camera"></i> Chọn ảnh
+                            <input type="file" id="avatarFileInput" hidden accept="image/*" onchange="previewAvatarAccount(this)">
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span class="fw-bold">Quên mật khẩu?</span>
+                        <button type="button" class="btn btn-link p-0" onclick="showForgotPasswordModal()">Gửi OTP / Link</button>
+                    </div>
+                </div>
+                <button type="button" class="btn btn-success w-100" onclick="saveAccountSettings()">
+                    <i class="bi bi-save"></i> Lưu thay đổi
+                </button>
+            </form>
+        `;
+    }
+    else if (profileSubScreen === 'preferences') {
+        titleEl.innerHTML = '<i class="bi bi-arrow-left me-2" style="cursor:pointer;" onclick="profileGoTo(\'main\')"></i> Tùy chỉnh ghi chú';
+        const currentFontSize = cfg.fontSize || '16px';
+        const currentTheme = cfg.theme || 'light';
+        const currentNoteColor = cfg.noteColor || '#ffffff';
+        const currentTextColor = cfg.textColor || '#0A1024';
+        const currentFontFamily = cfg.fontFamily || 'Inter, system-ui, sans-serif';
+        
+        bodyEl.innerHTML = `
+            <form id="preferencesForm">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Màu ghi chú mặc định</label>
+                    <input type="color" id="prefNoteColor" class="form-control form-control-color" value="${currentNoteColor}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Màu chữ (ghi chú)</label>
+                    <input type="color" id="prefTextColor" class="form-control form-control-color" value="${currentTextColor}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Phông chữ</label>
+                    <select id="prefFontFamily" class="form-select">
+                        <option value="Inter, system-ui, sans-serif" ${currentFontFamily.includes('Inter') ? 'selected' : ''}>Inter (Mặc định)</option>
+                        <option value="'Roboto', sans-serif" ${currentFontFamily.includes('Roboto') ? 'selected' : ''}>Roboto</option>
+                        <option value="'Poppins', sans-serif" ${currentFontFamily.includes('Poppins') ? 'selected' : ''}>Poppins</option>
+                        <option value="'Open Sans', sans-serif" ${currentFontFamily.includes('Open Sans') ? 'selected' : ''}>Open Sans</option>
+                        <option value="'Lato', sans-serif" ${currentFontFamily.includes('Lato') ? 'selected' : ''}>Lato</option>
+                        <option value="'Montserrat', sans-serif" ${currentFontFamily.includes('Montserrat') ? 'selected' : ''}>Montserrat</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Kích cỡ chữ</label>
+                    <select id="prefFontSize" class="form-select">
+                        <option value="14px" ${currentFontSize === '14px' ? 'selected' : ''}>Nhỏ (14px)</option>
+                        <option value="16px" ${currentFontSize === '16px' ? 'selected' : ''}>Vừa (16px)</option>
+                        <option value="18px" ${currentFontSize === '18px' ? 'selected' : ''}>Lớn (18px)</option>
+                        <option value="20px" ${currentFontSize === '20px' ? 'selected' : ''}>Siêu lớn (20px)</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Giao diện (Theme)</label>
+                    <select id="prefTheme" class="form-select">
+                        <option value="light" ${currentTheme === 'light' ? 'selected' : ''}>Sáng</option>
+                        <option value="dark" ${currentTheme === 'dark' ? 'selected' : ''}>Tối</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-success w-100" onclick="savePreferences()">
+                    <i class="bi bi-save"></i> Lưu thay đổi
+                </button>
+            </form>
+        `;
+    }
+}
+
+function profileGoTo(screen) {
+    profileSubScreen = screen;
+    renderProfileScreen();
+}
+
+function previewAvatarAccount(input) {
     if (input.files && input.files[0]) {
         const reader = new FileReader();
-        reader.onload = e => document.getElementById('previewAvatar').src = e.target.result;
+        reader.onload = e => document.getElementById('previewAvatarAccount').src = e.target.result;
         reader.readAsDataURL(input.files[0]);
     }
+}
+
+async function saveAccountSettings() {
+    const newDisplayName = document.getElementById('displayNameInput').value.trim();
+    const avatarFile = document.getElementById('avatarFileInput').files[0];
+    const oldPwd = document.getElementById('oldPassword').value;
+    const newPwd = document.getElementById('newPassword').value;
+    const confirmPwd = document.getElementById('confirmPassword').value;
+    
+    // 1. Cập nhật tên hiển thị
+    if (newDisplayName && newDisplayName !== window.APP_CONFIG?.displayName) {
+        const fd = new FormData();
+        fd.append('display_name', newDisplayName);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/update_display_name.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!data.success) showToast(data.message || 'Lỗi cập nhật tên', 'danger');
+            else {
+                window.APP_CONFIG.displayName = newDisplayName;
+                showToast('Cập nhật tên thành công', 'success');
+            }
+        } catch(e) { showToast('Lỗi kết nối khi đổi tên', 'danger'); }
+    }
+    
+    // 2. Đổi mật khẩu
+    if (oldPwd || newPwd || confirmPwd) {
+        if (!oldPwd || !newPwd || !confirmPwd) {
+            showToast('Vui lòng nhập đầy đủ mật khẩu cũ và mới', 'warning');
+            return;
+        }
+        if (newPwd.length < 6) {
+            showToast('Mật khẩu mới phải có ít nhất 6 ký tự', 'warning');
+            return;
+        }
+        if (newPwd !== confirmPwd) {
+            showToast('Mật khẩu xác nhận không khớp', 'warning');
+            return;
+        }
+        const fd = new FormData();
+        fd.append('old_password', oldPwd);
+        fd.append('new_password', newPwd);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/change_password.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!data.success) showToast(data.message, 'danger');
+            else showToast('Đổi mật khẩu thành công', 'success');
+        } catch(e) { showToast('Lỗi kết nối', 'danger'); }
+    }
+    
+    // 3. Upload avatar
+    if (avatarFile) {
+        const fd = new FormData();
+        fd.append('avatar', avatarFile);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/update_avatar.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.success) {
+                window.APP_CONFIG.avatar = data.avatar;
+                document.querySelector('.nav-avatar').src = data.avatar + '?v=' + Date.now();
+                showToast('Cập nhật avatar thành công', 'success');
+            } else showToast(data.message, 'danger');
+        } catch(e) { showToast('Lỗi upload ảnh', 'danger'); }
+    }
+    
+    // Refresh lại modal để cập nhật thông tin
+    setTimeout(() => renderProfileScreen(), 500);
+}
+
+async function savePreferences() {
+    const noteColor = document.getElementById('prefNoteColor').value;
+    const textColor = document.getElementById('prefTextColor').value;
+    const fontFamily = document.getElementById('prefFontFamily').value;
+    const fontSize = document.getElementById('prefFontSize').value;
+    const theme = document.getElementById('prefTheme').value;
+    
+    const fd = new FormData();
+    fd.append('note_color', noteColor);
+    fd.append('text_color', textColor);
+    fd.append('font_family', fontFamily);
+    fd.append('font_size', fontSize);
+    fd.append('theme_color', theme);
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/update_preferences.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            // Áp dụng màu nền mặc định
+            document.documentElement.style.setProperty('--note-default-color', noteColor);
+            // Áp dụng màu chữ
+            document.documentElement.style.setProperty('--note-text-color', textColor);
+            // Áp dụng font chữ
+            document.body.style.fontFamily = fontFamily;
+            // Áp dụng cỡ chữ - set vào html để tránh bị CSS ghi đè
+            document.documentElement.style.fontSize = fontSize;
+            document.body.style.fontSize = fontSize; // fallback
+            // Áp dụng theme
+            applyTheme(theme);
+            
+            // Cập nhật tất cả các note card hiện có để đồng bộ giao diện
+            document.querySelectorAll('.note-card').forEach(card => {
+                // Đảm bảo font-size được kế thừa từ html
+                card.style.fontSize = '';
+                // Cập nhật màu chữ nếu card chưa có màu nền riêng
+                const titleEl = card.querySelector('.card-title');
+                const textEl = card.querySelector('.card-text');
+                if (titleEl && !card.style.backgroundColor) titleEl.style.color = textColor;
+                if (textEl && !card.style.backgroundColor) textEl.style.color = textColor;
+            });
+            
+            // Cập nhật modal nếu đang mở
+            const modalContent = document.getElementById('modalContentWrapper');
+            if (modalContent && getComputedStyle(modalContent).backgroundColor !== 'rgba(0, 0, 0, 0)') {
+                modalContent.style.setProperty('--note-text-color', textColor);
+                const modalTexts = modalContent.querySelectorAll('.modal-title, .modal-body, .form-label, p, span:not(.badge)');
+                modalTexts.forEach(el => el.style.color = textColor);
+            }
+            
+            // Cập nhật APP_CONFIG
+            window.APP_CONFIG.noteColor = noteColor;
+            window.APP_CONFIG.textColor = textColor;
+            window.APP_CONFIG.fontFamily = fontFamily;
+            window.APP_CONFIG.fontSize = fontSize;
+            window.APP_CONFIG.theme = theme;
+            
+            showToast('Đã lưu tùy chỉnh ghi chú', 'success');
+            profileGoTo('main');
+        } else {
+            showToast(data.message || 'Lỗi lưu cài đặt', 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
+
+function showForgotPasswordModal() {
+    showConfirm('Bạn muốn nhận OTP hay link reset qua email?', 
+        () => sendResetRequest('otp'),
+        () => sendResetRequest('link')
+    );
+}
+
+async function sendResetRequest(type) {
+    const email = window.APP_CONFIG?.email;
+    if (!email) return;
+    const fd = new FormData();
+    fd.append('email', email);
+    fd.append('type', type);
+    appendCsrfToken(fd);
+    try {
+        const res = await fetch('api/send_reset_code.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Đã gửi ${type === 'otp' ? 'mã OTP' : 'link reset'} đến email của bạn`, 'success');
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) { showToast('Lỗi gửi yêu cầu', 'danger'); }
 }
 
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     localStorage.setItem('noteapp_theme', theme);
-    // Đảm bảo màu nền mặc định được giữ nguyên
-    const defaultColor = document.documentElement.style.getPropertyValue('--note-default-color');
-    if (defaultColor) {
-        document.documentElement.style.setProperty('--note-default-color', defaultColor);
-    }
 }
 
 // ====================== TIỆN ÍCH ======================
@@ -1759,7 +2138,6 @@ function changeColor(color) {
         .then(d => {
             if (d.success) {
                 showToast('Đã đổi màu ghi chú thành công', 'success');
-                // Broadcast color change via WebSocket
                 if (wsReady && currentNoteIdForWS == id) {
                     _wsSend({
                         type: 'color_update',

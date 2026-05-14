@@ -29,7 +29,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $_SESSION['font_size']    = $user['font_size'] ?? '16px';
                     $_SESSION['theme_color']  = $user['theme_color'] ?? 'light';
                     $_SESSION['note_color']   = $user['note_color'] ?? '#ffffff';
+                    $_SESSION['email']        = $user['email'];
+                    $_SESSION['text_color']   = $user['text_color'] ?? '#0A1024';
+                    $_SESSION['font_family']  = $user['font_family'] ?? 'Inter, system-ui, sans-serif';
                     $_SESSION['is_activated'] = (int)$user['is_activated'];
+                    
 
                     session_regenerate_id(true);
 

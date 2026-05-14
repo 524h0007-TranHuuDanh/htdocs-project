@@ -32,7 +32,6 @@
     --text-on-glass-dark-muted:   #9BAACB;
 
     /* ===== LIQUID GLASS — TRUE PANE OF GLASS ===== */
-    /* Almost invisible surface, lifted only by border + highlight + blur */
     --glass-bg-light:
         linear-gradient(150deg,
             rgba(255,255,255,0.12) 0%,
@@ -79,6 +78,7 @@
     --ease-glass:  cubic-bezier(0.16, 1, 0.3, 1);
 
     --note-default-color: #ffffff;
+    --note-text-color: #0A1024;
 }
 
 /* =========================================================
@@ -86,7 +86,7 @@
    ========================================================= */
 *, *::before, *::after { box-sizing: border-box; }
 
-html { color-scheme: light dark; }
+html { color-scheme: light dark; font-size: 100%; }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', system-ui, sans-serif;
@@ -411,7 +411,86 @@ body::after {
 }
 
 /* =========================================================
-   CARD BODY — enforce dark text on light
+   BULK SELECTION CHECKBOX
+   ========================================================= */
+.note-card .bulk-checkbox {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    z-index: 15;
+    width: 24px;
+    height: 24px;
+    cursor: pointer;
+    background: rgba(255,255,255,0.9);
+    border-radius: 8px;
+    border: 2px solid var(--primary, #5B9BFF);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    display: none;
+    transition: all 0.2s ease;
+}
+.bulk-mode .note-card .bulk-checkbox {
+    display: block;
+}
+.note-card .bulk-checkbox:checked {
+    background-color: var(--primary, #5B9BFF);
+    border-color: var(--primary, #5B9BFF);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='white'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E");
+    background-size: 16px;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+.note-card .bulk-checkbox:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    border-color: #aaa;
+    filter: grayscale(0.2);
+}
+
+/* =========================================================
+   BULK TOOLBAR (fixed bottom)
+   ========================================================= */
+#bulkToolbar {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1060;
+    background: rgba(255,255,255,0.28);
+    backdrop-filter: blur(32px) saturate(200%);
+    border-radius: 60px;
+    padding: 8px 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 1px 0 rgba(255,255,255,0.4) inset;
+    border: 1px solid rgba(255,255,255,0.4);
+    transition: all 0.3s var(--ease-spring);
+}
+#bulkToolbar .btn {
+    border-radius: 40px !important;
+    padding: 6px 16px;
+    font-weight: 500;
+}
+#bulkToolbar .btn-danger {
+    background: linear-gradient(135deg, #ff6b6b, #ee5a52);
+    border: none;
+}
+#bulkToolbar .btn-success {
+    background: linear-gradient(135deg, #20bf6b, #05c46b);
+}
+#bulkToolbar .btn-dark {
+    background: linear-gradient(135deg, #2d3436, #1e272e);
+}
+#bulkToolbar .btn-info {
+    background: linear-gradient(135deg, #4facfe, #00f2fe);
+}
+#bulkCounter {
+    background: rgba(0,0,0,0.3);
+    backdrop-filter: blur(4px);
+    border-radius: 40px;
+    padding: 2px 12px;
+    margin-left: 8px;
+}
+
+/* =========================================================
+   CARD BODY
    ========================================================= */
 .card-body {
     padding: 22px 24px !important;
@@ -1262,9 +1341,15 @@ body[data-bs-theme="dark"] .modal-content[style*="background"] .form-select,
 /* =========================================================
    GLOBAL FONT & NOTE COLOR SYSTEM (preserved)
    ========================================================= */
-body, .note-card, .modal-content, .form-control, .btn,
+html {
+    font-size: 100%;
+}
+body {
+    font-size: inherit;
+}
+.note-card, .modal-content, .form-control, .btn,
 h1, h2, h3, h4, h5, h6, p, span, div {
-    font-size: inherit !important;
+    font-size: inherit;
 }
 
 .note-card {
@@ -1320,4 +1405,32 @@ h1, h2, h3, h4, h5, h6, p, span, div {
 .modal-content[style*="background"] .btn-close {
     filter: none !important;
     opacity: 0.75;
+}
+
+/* =========================================================
+   NOTE TEXT COLOR - THEME AWARE
+   ========================================================= */
+.note-card .card-title,
+.note-card .card-text,
+.modal-content .modal-title,
+.modal-content .modal-body,
+.modal-content .form-label,
+.modal-content p,
+.modal-content span:not(.badge):not(.color-btn) {
+    color: var(--note-text-color, #0A1024) !important;
+}
+
+/* Trong dark mode, giữ nguyên màu chữ custom (đã được set từ inline) */
+body[data-bs-theme="dark"] .note-card[style*="background-color"] .card-title,
+body[data-bs-theme="dark"] .note-card[style*="background-color"] .card-text {
+    color: #0A1024 !important;
+}
+
+/* =========================================================
+   BULK MODE TOGGLE BUTTON ACTIVE STATE
+   ========================================================= */
+#toggleBulkModeBtn.active {
+    background-color: var(--primary) !important;
+    color: white !important;
+    border-color: var(--primary) !important;
 }

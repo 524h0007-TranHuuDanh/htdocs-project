@@ -4,7 +4,13 @@ HTDOCS
 |
 api - auth_helper.php
 |   |
+|   -bulk_action.php
+|   |
 |   - change_color.php
+|   |
+|   - change_password.php
+|   |
+|   - change_password.php
 |   |
 |   - delete_image.php
 |   |
@@ -32,9 +38,17 @@ api - auth_helper.php
 |   |
 |   - search.php
 |   |
+|   - send_reset_code.php
+|   |
 |   - set_note_label.php
 |   |
 |   - share_note.php
+|   |
+|   - update_avatar.php
+|   |
+|   - update_display_name.php
+|   |
+|   - update_preferences.php
 |   |
 |   - update_profile.php
 |   |
@@ -43,7 +57,7 @@ api - auth_helper.php
 |   - verify_note.php
 |   |
 |   - ws_token.php
-|
+|   
 App - NoteWebSocket.php
 |
 assets - css - style.css
@@ -149,7 +163,105 @@ function require_valid_csrf_post(): void {
     }
 }
 //----//
+bulk_action.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+check_login();
+require_valid_csrf_post();
 
+header('Content-Type: application/json');
+
+$action = $_POST['action'] ?? '';
+$ids = $_POST['ids'] ?? '';
+if (!is_array($ids)) {
+    $ids = explode(',', $ids);
+}
+$ids = array_filter(array_map('intval', $ids));
+$user_id = $_SESSION['user_id'];
+
+if (empty($ids)) {
+    echo json_encode(['success' => false, 'message' => 'Không có ghi chú nào được chọn']);
+    exit;
+}
+
+try {
+    // Kiểm tra quyền sở hữu (chỉ chủ mới bulk xóa/khôi phục/share)
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $checkStmt = $pdo->prepare("SELECT COUNT(*) FROM notes WHERE id IN ($placeholders) AND user_id = ?");
+    $checkStmt->execute(array_merge($ids, [$user_id]));
+    if ($checkStmt->fetchColumn() != count($ids)) {
+        echo json_encode(['success' => false, 'message' => 'Bạn không có quyền với một số ghi chú']);
+        exit;
+    }
+
+    if ($action === 'trash') {
+        $stmt = $pdo->prepare("UPDATE notes SET is_trashed = 1, is_pinned = 0 WHERE id IN ($placeholders)");
+        $stmt->execute($ids);
+        echo json_encode(['success' => true, 'message' => 'Đã chuyển ' . count($ids) . ' ghi chú vào thùng rác']);
+    } 
+    elseif ($action === 'restore') {
+        $stmt = $pdo->prepare("UPDATE notes SET is_trashed = 0 WHERE id IN ($placeholders)");
+        $stmt->execute($ids);
+        echo json_encode(['success' => true, 'message' => 'Đã khôi phục ' . count($ids) . ' ghi chú']);
+    }
+    elseif ($action === 'permanent') {
+        // Xóa vĩnh viễn: cần xóa ảnh vật lý trước
+        $imgStmt = $pdo->prepare("SELECT file_path FROM note_images WHERE note_id IN ($placeholders)");
+        $imgStmt->execute($ids);
+        while ($img = $imgStmt->fetch()) {
+            $file = '../' . $img['file_path'];
+            if (file_exists($file)) @unlink($file);
+        }
+        $stmt = $pdo->prepare("DELETE FROM notes WHERE id IN ($placeholders)");
+        $stmt->execute($ids);
+        echo json_encode(['success' => true, 'message' => 'Đã xóa vĩnh viễn ' . count($ids) . ' ghi chú']);
+    }
+    elseif ($action === 'share') {
+        // Nhận thêm email và permission
+        $emails = $_POST['emails'] ?? '';
+        $permission = $_POST['permission'] ?? 'read';
+        if (empty($emails)) {
+            echo json_encode(['success' => false, 'message' => 'Chưa nhập email']);
+            exit;
+        }
+        $emailList = array_unique(array_map('trim', explode(',', $emails)));
+        $successCount = 0;
+        $messages = [];
+        foreach ($ids as $note_id) {
+            foreach ($emailList as $email) {
+                // Kiểm tra user tồn tại
+                $userStmt = $pdo->prepare("SELECT id, email, display_name FROM users WHERE email = ?");
+                $userStmt->execute([$email]);
+                $receiver = $userStmt->fetch();
+                if (!$receiver || $receiver['id'] == $user_id) continue;
+                // Upsert shared_notes
+                $check = $pdo->prepare("SELECT id FROM shared_notes WHERE note_id = ? AND recipient_email = ?");
+                $check->execute([$note_id, $email]);
+                if ($check->fetch()) {
+                    $update = $pdo->prepare("UPDATE shared_notes SET permission = ? WHERE note_id = ? AND recipient_email = ?");
+                    $update->execute([$permission, $note_id, $email]);
+                } else {
+                    $insert = $pdo->prepare("INSERT INTO shared_notes (note_id, owner_id, recipient_email, permission) VALUES (?, ?, ?, ?)");
+                    $insert->execute([$note_id, $user_id, $email, $permission]);
+                }
+                $successCount++;
+                // Gửi mail (có thể gửi riêng từng note, nhưng để tránh spam, gửi một mail tổng hợp? Tạm thời gửi cho mỗi lần share)
+                require_once '../mail_config.php';
+                $senderName = $_SESSION['display_name'] ?? 'Một người dùng';
+                sendShareNotification($email, $receiver['display_name'], $senderName, "Nhiều ghi chú");
+            }
+        }
+        echo json_encode(['success' => true, 'message' => "Đã chia sẻ thành công $successCount lượt"]);
+    }
+    else {
+        echo json_encode(['success' => false, 'message' => 'Hành động không hợp lệ']);
+    }
+} catch (PDOException $e) {
+    echo json_encode(['success' => false, 'message' => 'Lỗi database: ' . $e->getMessage()]);
+}
+//----//
 change_color.php
 //code//
 <?php
@@ -170,6 +282,43 @@ echo json_encode(['success' => true]);
 ?>
 //----//
 
+change_password.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+require_once '../mail_config.php';
+check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json');
+
+$old = $_POST['old_password'] ?? '';
+$new = $_POST['new_password'] ?? '';
+
+if (strlen($new) < 6) {
+    echo json_encode(['success' => false, 'message' => 'Mật khẩu mới phải ≥6 ký tự']);
+    exit;
+}
+
+$stmt = $pdo->prepare("SELECT password_hash, email, display_name FROM users WHERE id = ?");
+$stmt->execute([$_SESSION['user_id']]);
+$user = $stmt->fetch();
+
+if (!password_verify($old, $user['password_hash'])) {
+    echo json_encode(['success' => false, 'message' => 'Mật khẩu cũ không đúng']);
+    exit;
+}
+
+$new_hash = password_hash($new, PASSWORD_DEFAULT);
+$stmt = $pdo->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
+$stmt->execute([$new_hash, $_SESSION['user_id']]);
+
+// Gửi email thông báo
+sendPasswordChangedNotification($user['email'], $user['display_name']);
+
+echo json_encode(['success' => true]);
+//----//
 delete_image.php
 //code//
 <?php
@@ -1218,6 +1367,46 @@ try {
 
 //----//
 
+send_reset_code.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+require_once '../mail_config.php';
+check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json');
+
+$type = $_POST['type'] ?? 'otp';
+$user_id = $_SESSION['user_id'];
+$stmt = $pdo->prepare("SELECT email, display_name FROM users WHERE id = ?");
+$stmt->execute([$user_id]);
+$user = $stmt->fetch();
+
+if (!$user) {
+    echo json_encode(['success' => false, 'message' => 'Không tìm thấy tài khoản']);
+    exit;
+}
+
+$reset_token = bin2hex(random_bytes(32));
+$expiry = date('Y-m-d H:i:s', strtotime('+15 minutes'));
+$pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
+    ->execute([$reset_token, $expiry, $user_id]);
+
+if ($type === 'link') {
+    $sent = sendResetLinkEmail($user['email'], $user['display_name'], $reset_token);
+    $msg = 'Link đặt lại mật khẩu đã được gửi';
+} else {
+    $otp = rand(100000, 999999);
+    $pdo->prepare("UPDATE users SET reset_token = ? WHERE id = ?")->execute([$otp, $user_id]);
+    $sent = sendResetOTPEmail($user['email'], $user['display_name'], $otp);
+    $msg = 'Mã OTP đã được gửi';
+}
+
+echo json_encode(['success' => $sent, 'message' => $sent ? $msg : 'Gửi email thất bại']);
+//----//
+
 set_note_label.php
 //code//
 <?php
@@ -1242,7 +1431,7 @@ if ($action == 'add') {
 echo json_encode(['success' => true]);
 //----//
 
-shared_note.php
+share_note.php
 //code//
 <?php
 require_once 'auth_helper.php';
@@ -1333,6 +1522,118 @@ try {
     echo json_encode(['success' => false, 'message' => 'Lỗi database']);
 }
 ?>
+//----//
+update_avatar.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json');
+
+if (!isset($_FILES['avatar']) || $_FILES['avatar']['error'] !== UPLOAD_ERR_OK) {
+    echo json_encode(['success' => false, 'message' => 'Không có file ảnh']);
+    exit;
+}
+
+$file = $_FILES['avatar'];
+$upload_dir = __DIR__ . '/../uploads/avatars/';
+if (!is_dir($upload_dir)) mkdir($upload_dir, 0755, true);
+
+$max_size = 2 * 1024 * 1024;
+if ($file['size'] > $max_size) {
+    echo json_encode(['success' => false, 'message' => 'Ảnh không được quá 2MB']);
+    exit;
+}
+
+$finfo = finfo_open(FILEINFO_MIME_TYPE);
+$mime_type = finfo_file($finfo, $file['tmp_name']);
+finfo_close($finfo);
+$allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+if (!in_array($mime_type, $allowed)) {
+    echo json_encode(['success' => false, 'message' => 'Chỉ chấp nhận JPG, PNG, GIF, WEBP']);
+    exit;
+}
+
+$ext_map = [
+    'image/jpeg' => 'jpg',
+    'image/png'  => 'png',
+    'image/gif'  => 'gif',
+    'image/webp' => 'webp'
+];
+$ext = $ext_map[$mime_type];
+$new_filename = 'avatar_' . $_SESSION['user_id'] . '_' . time() . '.' . $ext;
+$target_path = $upload_dir . $new_filename;
+$db_path = 'uploads/avatars/' . $new_filename;
+
+if (!move_uploaded_file($file['tmp_name'], $target_path)) {
+    echo json_encode(['success' => false, 'message' => 'Không thể lưu ảnh']);
+    exit;
+}
+
+// Xóa avatar cũ (nếu không phải default)
+$old = $_SESSION['avatar'] ?? '';
+if ($old && $old !== 'uploads/avatars/default-avatar.png' && file_exists(__DIR__ . '/../' . $old)) {
+    @unlink(__DIR__ . '/../' . $old);
+}
+
+$stmt = $pdo->prepare("UPDATE users SET avatar = ? WHERE id = ?");
+$stmt->execute([$db_path, $_SESSION['user_id']]);
+$_SESSION['avatar'] = $db_path;
+
+echo json_encode(['success' => true, 'avatar' => $db_path]);
+//----//
+
+update_display_name.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json');
+
+$new_name = trim($_POST['display_name'] ?? '');
+if (strlen($new_name) < 3 || strlen($new_name) > 50) {
+    echo json_encode(['success' => false, 'message' => 'Tên phải từ 3-50 ký tự']);
+    exit;
+}
+
+$stmt = $pdo->prepare("UPDATE users SET display_name = ? WHERE id = ?");
+$stmt->execute([$new_name, $_SESSION['user_id']]);
+$_SESSION['display_name'] = $new_name;
+echo json_encode(['success' => true]);
+//----//
+
+update_preferences.php
+//code//
+<?php
+require_once 'auth_helper.php';
+require_once '../database.php';
+check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json');
+
+$note_color = $_POST['note_color'] ?? '#ffffff';
+$text_color = $_POST['text_color'] ?? '#0A1024';
+$font_family = $_POST['font_family'] ?? 'Inter, system-ui, sans-serif';
+$font_size = $_POST['font_size'] ?? '16px';
+$theme_color = $_POST['theme_color'] ?? 'light';
+
+$stmt = $pdo->prepare("UPDATE users SET note_color = ?, text_color = ?, font_family = ?, font_size = ?, theme_color = ? WHERE id = ?");
+$stmt->execute([$note_color, $text_color, $font_family, $font_size, $theme_color, $_SESSION['user_id']]);
+
+$_SESSION['note_color'] = $note_color;
+$_SESSION['text_color'] = $text_color;
+$_SESSION['font_family'] = $font_family;
+$_SESSION['font_size'] = $font_size;
+$_SESSION['theme_color'] = $theme_color;
+
+echo json_encode(['success' => true]);
 //----//
 
 update_profile.php
@@ -1942,7 +2243,6 @@ class NoteWebSocket implements MessageComponentInterface {
 Thư mục assets
 css
 style.css
-//code//
 /* =========================================================
    LIQUID GLASS PRO — iOS 26 Edition (v3 · Crystal Clear)
    - Drastically more transparent surfaces (true liquid glass)
@@ -1977,7 +2277,6 @@ style.css
     --text-on-glass-dark-muted:   #9BAACB;
 
     /* ===== LIQUID GLASS — TRUE PANE OF GLASS ===== */
-    /* Almost invisible surface, lifted only by border + highlight + blur */
     --glass-bg-light:
         linear-gradient(150deg,
             rgba(255,255,255,0.12) 0%,
@@ -2024,6 +2323,7 @@ style.css
     --ease-glass:  cubic-bezier(0.16, 1, 0.3, 1);
 
     --note-default-color: #ffffff;
+    --note-text-color: #0A1024;
 }
 
 /* =========================================================
@@ -2031,7 +2331,7 @@ style.css
    ========================================================= */
 *, *::before, *::after { box-sizing: border-box; }
 
-html { color-scheme: light dark; }
+html { color-scheme: light dark; font-size: 100%; }
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', system-ui, sans-serif;
@@ -2356,7 +2656,86 @@ body::after {
 }
 
 /* =========================================================
-   CARD BODY — enforce dark text on light
+   BULK SELECTION CHECKBOX
+   ========================================================= */
+.note-card .bulk-checkbox {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    z-index: 15;
+    width: 24px;
+    height: 24px;
+    cursor: pointer;
+    background: rgba(255,255,255,0.9);
+    border-radius: 8px;
+    border: 2px solid var(--primary, #5B9BFF);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    display: none;
+    transition: all 0.2s ease;
+}
+.bulk-mode .note-card .bulk-checkbox {
+    display: block;
+}
+.note-card .bulk-checkbox:checked {
+    background-color: var(--primary, #5B9BFF);
+    border-color: var(--primary, #5B9BFF);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='white'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E");
+    background-size: 16px;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+.note-card .bulk-checkbox:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    border-color: #aaa;
+    filter: grayscale(0.2);
+}
+
+/* =========================================================
+   BULK TOOLBAR (fixed bottom)
+   ========================================================= */
+#bulkToolbar {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1060;
+    background: rgba(255,255,255,0.28);
+    backdrop-filter: blur(32px) saturate(200%);
+    border-radius: 60px;
+    padding: 8px 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 1px 0 rgba(255,255,255,0.4) inset;
+    border: 1px solid rgba(255,255,255,0.4);
+    transition: all 0.3s var(--ease-spring);
+}
+#bulkToolbar .btn {
+    border-radius: 40px !important;
+    padding: 6px 16px;
+    font-weight: 500;
+}
+#bulkToolbar .btn-danger {
+    background: linear-gradient(135deg, #ff6b6b, #ee5a52);
+    border: none;
+}
+#bulkToolbar .btn-success {
+    background: linear-gradient(135deg, #20bf6b, #05c46b);
+}
+#bulkToolbar .btn-dark {
+    background: linear-gradient(135deg, #2d3436, #1e272e);
+}
+#bulkToolbar .btn-info {
+    background: linear-gradient(135deg, #4facfe, #00f2fe);
+}
+#bulkCounter {
+    background: rgba(0,0,0,0.3);
+    backdrop-filter: blur(4px);
+    border-radius: 40px;
+    padding: 2px 12px;
+    margin-left: 8px;
+}
+
+/* =========================================================
+   CARD BODY
    ========================================================= */
 .card-body {
     padding: 22px 24px !important;
@@ -3207,9 +3586,15 @@ body[data-bs-theme="dark"] .modal-content[style*="background"] .form-select,
 /* =========================================================
    GLOBAL FONT & NOTE COLOR SYSTEM (preserved)
    ========================================================= */
-body, .note-card, .modal-content, .form-control, .btn,
+html {
+    font-size: 100%;
+}
+body {
+    font-size: inherit;
+}
+.note-card, .modal-content, .form-control, .btn,
 h1, h2, h3, h4, h5, h6, p, span, div {
-    font-size: inherit !important;
+    font-size: inherit;
 }
 
 .note-card {
@@ -3267,6 +3652,33 @@ h1, h2, h3, h4, h5, h6, p, span, div {
     opacity: 0.75;
 }
 
+/* =========================================================
+   NOTE TEXT COLOR - THEME AWARE
+   ========================================================= */
+.note-card .card-title,
+.note-card .card-text,
+.modal-content .modal-title,
+.modal-content .modal-body,
+.modal-content .form-label,
+.modal-content p,
+.modal-content span:not(.badge):not(.color-btn) {
+    color: var(--note-text-color, #0A1024) !important;
+}
+
+/* Trong dark mode, giữ nguyên màu chữ custom (đã được set từ inline) */
+body[data-bs-theme="dark"] .note-card[style*="background-color"] .card-title,
+body[data-bs-theme="dark"] .note-card[style*="background-color"] .card-text {
+    color: #0A1024 !important;
+}
+
+/* =========================================================
+   BULK MODE TOGGLE BUTTON ACTIVE STATE
+   ========================================================= */
+#toggleBulkModeBtn.active {
+    background-color: var(--primary) !important;
+    color: white !important;
+    border-color: var(--primary) !important;
+}
 
 //----//
 
@@ -3291,6 +3703,10 @@ let autoSaveBusyTimer      = null;
 let autoSaveInFlightSeq    = 0;
 let lastAutoSavePersistSig = '';
 let isSaving               = false;
+let bulkMode = false;
+let bulkShareModal = null;
+let selectedNotes = new Set(); // lưu id
+let currentNotesList = []; // lưu danh sách note hiện tại để kiểm tra khóa
 /** Coalesces list refresh after rapid autosaves (single search request). */
 let liveSearchAfterSaveTimer = null;
 /** True while applying server title/content+version after HTTP conflict; blocks autosave to avoid stale POSTs. */
@@ -3308,6 +3724,8 @@ const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+let profileSubScreen    = null; // Biến mới cho profile
+
 function resetPasswordModalToDefault() {
     const modal = document.getElementById('passwordModal');
     if (!modal) return;
@@ -3380,6 +3798,7 @@ function setNoteOwnerToolbarVisible(visible) {
 
 // ====================== DOM READY (một handler duy nhất) ======================
 document.addEventListener('DOMContentLoaded', () => {
+    bulkShareModal = new bootstrap.Modal(document.getElementById('bulkShareModal'));
     // --- Modals Bootstrap ---
     noteModal          = new bootstrap.Modal(document.getElementById('noteModal'));
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
@@ -3405,21 +3824,8 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(loadNotesOfflineFallback, 800);
     }
 
-    // --- Theme preview ---
-    const themeSelect = document.getElementById('settingTheme');
-    if (themeSelect) {
-        themeSelect.addEventListener('change', function () {
-            applyTheme(this.value);
-        });
-    }
-
-    // --- Font size preview ---
-    const fontSelect = document.getElementById('settingFontSize');
-    if (fontSelect) {
-        fontSelect.addEventListener('change', function () {
-            document.body.style.fontSize = this.value;
-        });
-    }
+    // --- Theme preview (đã được thay bằng profile mới, giữ lại applyTheme) ---
+    // Không còn themeSelect, fontSelect cũ vì đã chuyển vào profile
 
     // --- Force sync content khi blur khỏi noteContent ---
     const noteContentEl = document.getElementById('noteContent');
@@ -3447,10 +3853,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (savedNoteColor) {
         document.documentElement.style.setProperty('--note-default-color', savedNoteColor);
     }
-    // Lưu lại khi người dùng thay đổi trong profile
-    document.getElementById('settingNoteColor')?.addEventListener('change', function() {
-        localStorage.setItem('noteapp_note_color', this.value);
-    });
+    // Lưu lại khi người dùng thay đổi trong profile (sẽ được xử lý qua savePreferences)
+        // Bulk selection buttons
+    const toggleBtn = document.getElementById('toggleBulkModeBtn');
+    if (toggleBtn) toggleBtn.addEventListener('click', toggleBulkMode);
+    
+    const bulkDelete = document.getElementById('bulkDeleteBtn');
+    const bulkRestore = document.getElementById('bulkRestoreBtn');
+    const bulkPermanent = document.getElementById('bulkPermanentBtn');
+    const bulkShare = document.getElementById('bulkShareBtn');
+    const bulkCancel = document.getElementById('bulkCancelBtn');
+    
+    if (bulkDelete) bulkDelete.addEventListener('click', () => bulkAction('trash'));
+    if (bulkRestore) bulkRestore.addEventListener('click', () => bulkAction('restore'));
+    if (bulkPermanent) bulkPermanent.addEventListener('click', () => bulkAction('permanent'));
+    if (bulkShare) bulkShare.addEventListener('click', () => bulkAction('share'));
+    if (bulkCancel) bulkCancel.addEventListener('click', toggleBulkMode);
 });
 
 // ====================== REALTIME TYPING BROADCAST (80ms debounce) ======================
@@ -3475,6 +3893,7 @@ function setViewMode(mode) {
 
     setTimeout(() => {
         currentViewMode = mode;
+        if (bulkMode) toggleBulkMode();
         currentLabelId  = null;
 
         document.getElementById('btnViewShared').style.display  = mode === 'shared'   ? 'none' : 'block';
@@ -3611,7 +4030,18 @@ function renderNotes(notes) {
             body.dataset.permission,
             body.dataset.ownerName
         ));
-
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'bulk-checkbox';
+        checkbox.dataset.id = n.id;
+        checkbox.disabled = (n.is_locked == 1); // nếu có mật khẩu
+        checkbox.addEventListener('change', (e) => {
+            e.stopPropagation();
+            if (checkbox.checked) selectedNotes.add(n.id);
+            else selectedNotes.delete(n.id);
+            updateBulkToolbar();
+        });
+        card.appendChild(checkbox);
         body.innerHTML = `
             ${currentViewMode === 'my_notes'
                 ? `<button class="btn btn-sm position-absolute top-0 end-0 m-2 border-0"
@@ -3632,7 +4062,134 @@ function renderNotes(notes) {
         container.appendChild(card);
     });
 }
+// ====================== BULK SELECTION ======================
+function updateBulkToolbar() {
+    const count = selectedNotes.size;
+    const counter = document.getElementById('bulkCounter');
+    if (counter) counter.innerText = count;
+    
+    const isTrash = (currentViewMode === 'trash');
+    const deleteBtn = document.getElementById('bulkDeleteBtn');
+    const restoreBtn = document.getElementById('bulkRestoreBtn');
+    const permanentBtn = document.getElementById('bulkPermanentBtn');
+    const shareBtn = document.getElementById('bulkShareBtn');
+    
+    if (deleteBtn) deleteBtn.style.display = isTrash ? 'none' : 'inline-flex';
+    if (restoreBtn) restoreBtn.style.display = isTrash ? 'inline-flex' : 'none';
+    if (permanentBtn) permanentBtn.style.display = isTrash ? 'inline-flex' : 'none';
+    if (shareBtn) shareBtn.style.display = (currentViewMode === 'my_notes' && !isTrash) ? 'inline-flex' : 'none';
+}
 
+function toggleBulkMode() {
+    bulkMode = !bulkMode;
+    const container = document.getElementById('notesContainer');
+    const toolbar = document.getElementById('bulkToolbar');
+    const toggleBtn = document.getElementById('toggleBulkModeBtn');
+    
+    if (bulkMode) {
+        container.classList.add('bulk-mode');
+        toolbar.classList.remove('d-none');
+        toggleBtn.classList.add('active');
+        selectedNotes.clear();
+        updateBulkToolbar();
+    } else {
+        container.classList.remove('bulk-mode');
+        toolbar.classList.add('d-none');
+        toggleBtn.classList.remove('active');
+        // Bỏ chọn tất cả checkbox
+        document.querySelectorAll('.bulk-checkbox').forEach(cb => {
+            cb.checked = false;
+        });
+        selectedNotes.clear();
+    }
+}
+
+async function bulkAction(action) {
+    if (selectedNotes.size === 0) {
+        showToast('Chưa chọn ghi chú nào', 'warning');
+        return;
+    }
+    
+    if (action === 'share') {
+        // Hiển thị modal nhập email và quyền
+        document.getElementById('bulkShareEmails').value = '';
+        document.getElementById('bulkSharePermission').value = 'read';
+        bulkShareModal.show();
+        
+        // Xử lý khi nhấn nút xác nhận
+        const confirmBtn = document.getElementById('bulkShareConfirmBtn');
+        const oldHandler = confirmBtn.onclick;
+        confirmBtn.onclick = async () => {
+            const emails = document.getElementById('bulkShareEmails').value.trim();
+            const permission = document.getElementById('bulkSharePermission').value;
+            if (!emails) {
+                showToast('Vui lòng nhập email', 'warning');
+                return;
+            }
+            bulkShareModal.hide();
+            await executeBulkShare(emails, permission);
+        };
+        return;
+    }
+    
+    // Các action khác (trash, restore, permanent) dùng confirm cũ
+    let confirmMsg = '';
+    if (action === 'trash') {
+        confirmMsg = `Bạn có chắc muốn chuyển ${selectedNotes.size} ghi chú vào thùng rác?`;
+    } else if (action === 'restore') {
+        confirmMsg = `Khôi phục ${selectedNotes.size} ghi chú?`;
+    } else if (action === 'permanent') {
+        confirmMsg = `Xóa vĩnh viễn ${selectedNotes.size} ghi chú? Hành động này không thể hoàn tác.`;
+    } else {
+        return;
+    }
+    
+    showConfirm(confirmMsg, () => executeBulkAction(action));
+}
+
+async function executeBulkShare(emails, permission) {
+    const fd = new FormData();
+    fd.append('action', 'share');
+    fd.append('ids', Array.from(selectedNotes).join(','));
+    fd.append('emails', emails);
+    fd.append('permission', permission);
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/bulk_action.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message, 'success');
+            toggleBulkMode();
+            liveSearch();
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
+
+async function executeBulkAction(action) {
+    const fd = new FormData();
+    fd.append('action', action);
+    fd.append('ids', Array.from(selectedNotes).join(','));
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/bulk_action.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(data.message, 'success');
+            toggleBulkMode();
+            liveSearch();
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
 // ====================== MỞ GHI CHÚ & PASSWORD ======================
 function handleNoteOpen(id, title, content, isLocked, color, permission, ownerName) {
     // Kiểm tra modal tồn tại
@@ -3867,8 +4424,6 @@ function closeAndReload() {
 }
 
 // ====================== AUTO SAVE ======================
-// Tích hợp: offline fallback + WebSocket broadcast + xử lý conflict
-// =========================================================
 function _autoSavePayloadSignature() {
     const noteId  = document.getElementById('noteId').value;
     const title   = document.getElementById('noteTitle').value.trim();
@@ -3982,7 +4537,6 @@ function autoSave() {
                         noteConflictResolutionLock = true;
                         window.__remoteUpdating = true;
                         try {
-                            // Apply server fields first; only then bump version (never version without synced title+body).
                             if (hasLatestTitle) {
                                 titleEl.value = d.latest_title;
                             }
@@ -4286,7 +4840,6 @@ function _openPasswordModal(config) {
                 .then(shouldClose => {
                     if (shouldClose === true) {
                         passwordModalInstance.hide();
-                        // Reset modal password về dạng nhập mật khẩu mở note
                         resetPasswordModalToDefault();
                         liveSearch();
                     }
@@ -4295,7 +4848,6 @@ function _openPasswordModal(config) {
         });
     });
 
-    // Khi modal bị đóng bằng nút Hủy hoặc dấu X, cũng reset lại
     const modalEl = document.getElementById('passwordModal');
     const onHidden = () => {
         resetPasswordModalToDefault();
@@ -4496,135 +5048,133 @@ function connectWebSocket() {
                 _setWsStatus('connecting');
             };
 
-       socket.onmessage = (event) => {
-    if (ws !== socket) return;
-    try {
-        const data = JSON.parse(event.data);
+            socket.onmessage = (event) => {
+                if (ws !== socket) return;
+                try {
+                    const data = JSON.parse(event.data);
 
-        if (data.type === 'auth_error') {
-            wsReady = false;
-            _setWsStatus('offline');
-            try { socket.close(); } catch (e2) {}
-            return;
-        }
-
-        if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
-            console.warn('[WS] join_denied:', data.message || '');
-            return;
-        }
-
-        if (data.type === 'auth_success') {
-            wsReady = true;
-            _setWsStatus('online');
-            if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
-        }
-
-        if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-            if (data.user_name === currentUserName) return;
-
-            const contentElPre = document.getElementById('noteContent');
-            const incomingVer = data.version != null && data.version !== ''
-                ? parseInt(data.version, 10)
-                : NaN;
-            const rawLocal = contentElPre && contentElPre.dataset.version;
-            const localVer = rawLocal !== undefined && rawLocal !== ''
-                ? parseInt(rawLocal, 10)
-                : NaN;
-            if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
-                return;
-            }
-
-            const c = String(data.content ?? '');
-            const inboundKey = [
-                data.note_id,
-                data.user_name,
-                data.timestamp ?? '',
-                data.title ?? '',
-                c.length,
-                c.slice(0, 256)
-            ].join('\x1e');
-            if (inboundKey === _lastWsInboundKey) return;
-            _lastWsInboundKey = inboundKey;
-
-            const titleEl   = document.getElementById('noteTitle');
-            const contentEl = document.getElementById('noteContent');
-
-            const isEditingTitle   = document.activeElement === titleEl;
-            const isEditingContent = document.activeElement === contentEl;
-
-            window.__remoteUpdating = true;
-            try {
-                if (data.version != null && data.version !== '') {
-                    contentEl.dataset.version = String(data.version);
-                }
-
-                if (data.title !== undefined && !isEditingTitle) {
-                    titleEl.value = data.title;
-                }
-
-                if (data.content !== undefined) {
-                    const currentContent  = contentEl.value    || '';
-                    const incomingContent = String(data.content);
-
-                    if (!isEditingContent) {
-                        contentEl.value = incomingContent;
-                    } else {
-                        const isDeleting   = incomingContent.length < currentContent.length;
-                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                        if (isDeleting || tooDifferent) {
-                            const cursorPos = contentEl.selectionStart;
-                            contentEl.value = incomingContent;
-                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
-                        }
+                    if (data.type === 'auth_error') {
+                        wsReady = false;
+                        _setWsStatus('offline');
+                        try { socket.close(); } catch (e2) {}
+                        return;
                     }
+
+                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+                        console.warn('[WS] join_denied:', data.message || '');
+                        return;
+                    }
+
+                    if (data.type === 'auth_success') {
+                        wsReady = true;
+                        _setWsStatus('online');
+                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+                    }
+
+                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+                        if (data.user_name === currentUserName) return;
+
+                        const contentElPre = document.getElementById('noteContent');
+                        const incomingVer = data.version != null && data.version !== ''
+                            ? parseInt(data.version, 10)
+                            : NaN;
+                        const rawLocal = contentElPre && contentElPre.dataset.version;
+                        const localVer = rawLocal !== undefined && rawLocal !== ''
+                            ? parseInt(rawLocal, 10)
+                            : NaN;
+                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                            return;
+                        }
+
+                        const c = String(data.content ?? '');
+                        const inboundKey = [
+                            data.note_id,
+                            data.user_name,
+                            data.timestamp ?? '',
+                            data.title ?? '',
+                            c.length,
+                            c.slice(0, 256)
+                        ].join('\x1e');
+                        if (inboundKey === _lastWsInboundKey) return;
+                        _lastWsInboundKey = inboundKey;
+
+                        const titleEl   = document.getElementById('noteTitle');
+                        const contentEl = document.getElementById('noteContent');
+
+                        const isEditingTitle   = document.activeElement === titleEl;
+                        const isEditingContent = document.activeElement === contentEl;
+
+                        window.__remoteUpdating = true;
+                        try {
+                            if (data.version != null && data.version !== '') {
+                                contentEl.dataset.version = String(data.version);
+                            }
+
+                            if (data.title !== undefined && !isEditingTitle) {
+                                titleEl.value = data.title;
+                            }
+
+                            if (data.content !== undefined) {
+                                const currentContent  = contentEl.value    || '';
+                                const incomingContent = String(data.content);
+
+                                if (!isEditingContent) {
+                                    contentEl.value = incomingContent;
+                                } else {
+                                    const isDeleting   = incomingContent.length < currentContent.length;
+                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                                    if (isDeleting || tooDifferent) {
+                                        const cursorPos = contentEl.selectionStart;
+                                        contentEl.value = incomingContent;
+                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                                    }
+                                }
+                            }
+                        } finally {
+                            window.__remoteUpdating = false;
+                        }
+
+                        _showTypingIndicator(data.user_name);
+                    }
+
+                    // ========== XỬ LÝ MÀU SẮC ==========
+                    if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
+                        const modalWrapper = document.getElementById('modalContentWrapper');
+                        if (modalWrapper) {
+                            modalWrapper.style.backgroundColor = data.color;
+                            modalWrapper.style.setProperty('--note-individual-color', data.color);
+                        }
+                        const cards = document.querySelectorAll('.note-card');
+                        cards.forEach(card => {
+                            const body = card.querySelector('.card-body');
+                            if (body && body.dataset.id == data.note_id) {
+                                card.style.backgroundColor = data.color;
+                            }
+                        });
+                        _showTypingIndicator(data.user_name + ' đã đổi màu');
+                    }
+
+                    // ========== XỬ LÝ THÊM ẢNH ==========
+                    if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
+                        renderImage(data.file_path, data.image_id, currentPermission);
+                        _showTypingIndicator(data.user_name + ' đã thêm ảnh');
+                    }
+
+                    // ========== XỬ LÝ XÓA ẢNH ==========
+                    if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
+                        const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
+                        if (imgDiv) imgDiv.remove();
+                        _showTypingIndicator(data.user_name + ' đã xóa ảnh');
+                    }
+
+                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+                        _renderPresence(data.users);
+                    }
+                } catch (e) {
+                    console.error('WS parse error:', e);
                 }
-            } finally {
-                window.__remoteUpdating = false;
-            }
-
-            _showTypingIndicator(data.user_name);
-        }
-
-        // ========== XỬ LÝ MÀU SẮC ==========
-        if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
-            const modalWrapper = document.getElementById('modalContentWrapper');
-            if (modalWrapper) {
-                modalWrapper.style.backgroundColor = data.color;
-                modalWrapper.style.setProperty('--note-individual-color', data.color);
-            }
-            // Cập nhật card trong danh sách nếu có
-            const cards = document.querySelectorAll('.note-card');
-            cards.forEach(card => {
-                const body = card.querySelector('.card-body');
-                if (body && body.dataset.id == data.note_id) {
-                    card.style.backgroundColor = data.color;
-                }
-            });
-            _showTypingIndicator(data.user_name + ' đã đổi màu');
-        }
-
-        // ========== XỬ LÝ THÊM ẢNH ==========
-        if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
-            // Gọi hàm renderImage với permission hiện tại
-            renderImage(data.file_path, data.image_id, currentPermission);
-            _showTypingIndicator(data.user_name + ' đã thêm ảnh');
-        }
-
-        // ========== XỬ LÝ XÓA ẢNH ==========
-        if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
-            const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
-            if (imgDiv) imgDiv.remove();
-            _showTypingIndicator(data.user_name + ' đã xóa ảnh');
-        }
-
-        if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-            _renderPresence(data.users);
-        }
-    } catch (e) {
-        console.error('WS parse error:', e);
-    }
-};
+            };
 
             socket.onclose = () => {
                 if (ws !== socket) return;
@@ -4764,7 +5314,6 @@ function uploadImage() {
         .then(d => {
             if (d.success) {
                 renderImage(d.file_path, d.image_id, 'owner');
-                // Broadcast image added
                 if (wsReady && currentNoteIdForWS == nid) {
                     _wsSend({
                         type: 'image_added',
@@ -4804,7 +5353,6 @@ function deleteImage(id, btn) {
             if (d.success) {
                 const imgDiv = btn.closest('[data-image-id]');
                 if (imgDiv) imgDiv.remove();
-                // Broadcast image deleted
                 if (wsReady && currentNoteIdForWS) {
                     _wsSend({
                         type: 'image_deleted',
@@ -4923,68 +5471,311 @@ function removeLabel(nid, lid) {
     }).then(() => { loadLabelsForNote(nid); liveSearch(); });
 }
 
-// ====================== PROFILE / SETTINGS ======================
-function saveProfile() {
-    const fd = new FormData();
-
-    const avatarFile = document.getElementById('inputAvatar').files[0];
-    if (avatarFile) fd.append('avatar', avatarFile);
-
-    const fontSize = document.getElementById('settingFontSize').value;
-    const theme = document.getElementById('settingTheme').value;
-    const noteColor = document.getElementById('settingNoteColor').value;
-
-    fd.append('font_size', fontSize);
-    fd.append('theme_color', theme);
-    fd.append('note_color', noteColor);
-    appendCsrfToken(fd);
-
-    // Áp dụng ngay lập tức cho giao diện
-    applyTheme(theme);
-    document.documentElement.style.fontSize = fontSize;
-    document.body.style.fontSize = fontSize;
-    document.documentElement.style.setProperty('--note-default-color', noteColor);
-    // Cập nhật màu cho tất cả các note card hiện tại (nếu không có màu riêng)
-    document.querySelectorAll('.note-card').forEach(card => {
-        if (!card.style.backgroundColor) {
-            card.style.backgroundColor = noteColor;
-        }
-    });
-
-    fetch('api/update_profile.php', { method: 'POST', body: fd })
-        .then(r => r.json())
-        .then(data => {
-            if (data.success) {
-                if (avatarFile) {
-                    location.reload();
-                } else {
-                    const modal = bootstrap.Modal.getInstance(document.getElementById('profileModal'));
-                    if (modal) modal.hide();
-                    showToast('Đã lưu thay đổi thành công!', 'success');
-                }
-            } else {
-                showAlert(data.message || 'Lỗi cập nhật!', 'danger');
-            }
-        })
-        .catch(() => showAlert('Lỗi kết nối!', 'danger'));
+// ====================== PROFILE / SETTINGS (MỚI) ======================
+function showProfileModal() {
+    profileSubScreen = 'main';
+    renderProfileScreen();
+    const modal = new bootstrap.Modal(document.getElementById('profileModal'));
+    modal.show();
 }
 
-function previewImage(input) {
+function renderProfileScreen() {
+    const titleEl = document.getElementById('profileModalTitle');
+    const bodyEl = document.getElementById('profileModalBody');
+    const cfg = window.APP_CONFIG || {};
+
+    if (profileSubScreen === 'main') {
+        titleEl.innerHTML = '<i class="bi bi-person-circle"></i> Tài khoản & Tùy chỉnh';
+        bodyEl.innerHTML = `
+            <div class="d-grid gap-3">
+                <button class="btn btn-outline-primary btn-lg py-3" onclick="profileGoTo('account')">
+                    <i class="bi bi-gear-wide-connected fs-4 me-2"></i> Cài đặt tài khoản
+                </button>
+                <button class="btn btn-outline-secondary btn-lg py-3" onclick="profileGoTo('preferences')">
+                    <i class="bi bi-palette fs-4 me-2"></i> Tùy chỉnh ghi chú
+                </button>
+            </div>
+            <div class="mt-4 text-center">
+                <img src="${escapeHtml(cfg.avatar || 'uploads/avatars/default-avatar.png')}" 
+                     class="rounded-circle border shadow-sm" style="width:64px;height:64px;object-fit:cover;">
+                <div class="mt-2">
+                    <strong>${escapeHtml(cfg.displayName || 'Người dùng')}</strong><br>
+                    <small class="text-muted">${escapeHtml(cfg.email || '')}</small>
+                </div>
+            </div>
+        `;
+    } 
+    else if (profileSubScreen === 'account') {
+        titleEl.innerHTML = '<i class="bi bi-arrow-left me-2" style="cursor:pointer;" onclick="profileGoTo(\'main\')"></i> Cài đặt tài khoản';
+        bodyEl.innerHTML = `
+            <form id="accountSettingsForm">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Email</label>
+                    <input type="email" class="form-control" value="${escapeHtml(cfg.email || '')}" readonly disabled>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Tên hiển thị</label>
+                    <input type="text" id="displayNameInput" class="form-control" value="${escapeHtml(cfg.displayName || '')}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Đổi mật khẩu</label>
+                    <input type="password" id="oldPassword" class="form-control mb-2" placeholder="Mật khẩu hiện tại">
+                    <input type="password" id="newPassword" class="form-control mb-2" placeholder="Mật khẩu mới (≥6 ký tự)">
+                    <input type="password" id="confirmPassword" class="form-control" placeholder="Xác nhận mật khẩu mới">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Ảnh đại diện</label>
+                    <div class="d-flex align-items-center gap-3">
+                        <img id="previewAvatarAccount" src="${escapeHtml(cfg.avatar || 'uploads/avatars/default-avatar.png')}" 
+                             style="width:60px;height:60px;object-fit:cover;border-radius:50%;">
+                        <label class="btn btn-sm btn-outline-primary">
+                            <i class="bi bi-camera"></i> Chọn ảnh
+                            <input type="file" id="avatarFileInput" hidden accept="image/*" onchange="previewAvatarAccount(this)">
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <span class="fw-bold">Quên mật khẩu?</span>
+                        <button type="button" class="btn btn-link p-0" onclick="showForgotPasswordModal()">Gửi OTP / Link</button>
+                    </div>
+                </div>
+                <button type="button" class="btn btn-success w-100" onclick="saveAccountSettings()">
+                    <i class="bi bi-save"></i> Lưu thay đổi
+                </button>
+            </form>
+        `;
+    }
+    else if (profileSubScreen === 'preferences') {
+        titleEl.innerHTML = '<i class="bi bi-arrow-left me-2" style="cursor:pointer;" onclick="profileGoTo(\'main\')"></i> Tùy chỉnh ghi chú';
+        const currentFontSize = cfg.fontSize || '16px';
+        const currentTheme = cfg.theme || 'light';
+        const currentNoteColor = cfg.noteColor || '#ffffff';
+        const currentTextColor = cfg.textColor || '#0A1024';
+        const currentFontFamily = cfg.fontFamily || 'Inter, system-ui, sans-serif';
+        
+        bodyEl.innerHTML = `
+            <form id="preferencesForm">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Màu ghi chú mặc định</label>
+                    <input type="color" id="prefNoteColor" class="form-control form-control-color" value="${currentNoteColor}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Màu chữ (ghi chú)</label>
+                    <input type="color" id="prefTextColor" class="form-control form-control-color" value="${currentTextColor}">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Phông chữ</label>
+                    <select id="prefFontFamily" class="form-select">
+                        <option value="Inter, system-ui, sans-serif" ${currentFontFamily.includes('Inter') ? 'selected' : ''}>Inter (Mặc định)</option>
+                        <option value="'Roboto', sans-serif" ${currentFontFamily.includes('Roboto') ? 'selected' : ''}>Roboto</option>
+                        <option value="'Poppins', sans-serif" ${currentFontFamily.includes('Poppins') ? 'selected' : ''}>Poppins</option>
+                        <option value="'Open Sans', sans-serif" ${currentFontFamily.includes('Open Sans') ? 'selected' : ''}>Open Sans</option>
+                        <option value="'Lato', sans-serif" ${currentFontFamily.includes('Lato') ? 'selected' : ''}>Lato</option>
+                        <option value="'Montserrat', sans-serif" ${currentFontFamily.includes('Montserrat') ? 'selected' : ''}>Montserrat</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Kích cỡ chữ</label>
+                    <select id="prefFontSize" class="form-select">
+                        <option value="14px" ${currentFontSize === '14px' ? 'selected' : ''}>Nhỏ (14px)</option>
+                        <option value="16px" ${currentFontSize === '16px' ? 'selected' : ''}>Vừa (16px)</option>
+                        <option value="18px" ${currentFontSize === '18px' ? 'selected' : ''}>Lớn (18px)</option>
+                        <option value="20px" ${currentFontSize === '20px' ? 'selected' : ''}>Siêu lớn (20px)</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Giao diện (Theme)</label>
+                    <select id="prefTheme" class="form-select">
+                        <option value="light" ${currentTheme === 'light' ? 'selected' : ''}>Sáng</option>
+                        <option value="dark" ${currentTheme === 'dark' ? 'selected' : ''}>Tối</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-success w-100" onclick="savePreferences()">
+                    <i class="bi bi-save"></i> Lưu thay đổi
+                </button>
+            </form>
+        `;
+    }
+}
+
+function profileGoTo(screen) {
+    profileSubScreen = screen;
+    renderProfileScreen();
+}
+
+function previewAvatarAccount(input) {
     if (input.files && input.files[0]) {
         const reader = new FileReader();
-        reader.onload = e => document.getElementById('previewAvatar').src = e.target.result;
+        reader.onload = e => document.getElementById('previewAvatarAccount').src = e.target.result;
         reader.readAsDataURL(input.files[0]);
     }
+}
+
+async function saveAccountSettings() {
+    const newDisplayName = document.getElementById('displayNameInput').value.trim();
+    const avatarFile = document.getElementById('avatarFileInput').files[0];
+    const oldPwd = document.getElementById('oldPassword').value;
+    const newPwd = document.getElementById('newPassword').value;
+    const confirmPwd = document.getElementById('confirmPassword').value;
+    
+    // 1. Cập nhật tên hiển thị
+    if (newDisplayName && newDisplayName !== window.APP_CONFIG?.displayName) {
+        const fd = new FormData();
+        fd.append('display_name', newDisplayName);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/update_display_name.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!data.success) showToast(data.message || 'Lỗi cập nhật tên', 'danger');
+            else {
+                window.APP_CONFIG.displayName = newDisplayName;
+                showToast('Cập nhật tên thành công', 'success');
+            }
+        } catch(e) { showToast('Lỗi kết nối khi đổi tên', 'danger'); }
+    }
+    
+    // 2. Đổi mật khẩu
+    if (oldPwd || newPwd || confirmPwd) {
+        if (!oldPwd || !newPwd || !confirmPwd) {
+            showToast('Vui lòng nhập đầy đủ mật khẩu cũ và mới', 'warning');
+            return;
+        }
+        if (newPwd.length < 6) {
+            showToast('Mật khẩu mới phải có ít nhất 6 ký tự', 'warning');
+            return;
+        }
+        if (newPwd !== confirmPwd) {
+            showToast('Mật khẩu xác nhận không khớp', 'warning');
+            return;
+        }
+        const fd = new FormData();
+        fd.append('old_password', oldPwd);
+        fd.append('new_password', newPwd);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/change_password.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!data.success) showToast(data.message, 'danger');
+            else showToast('Đổi mật khẩu thành công', 'success');
+        } catch(e) { showToast('Lỗi kết nối', 'danger'); }
+    }
+    
+    // 3. Upload avatar
+    if (avatarFile) {
+        const fd = new FormData();
+        fd.append('avatar', avatarFile);
+        appendCsrfToken(fd);
+        try {
+            const res = await fetch('api/update_avatar.php', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (data.success) {
+                window.APP_CONFIG.avatar = data.avatar;
+                document.querySelector('.nav-avatar').src = data.avatar + '?v=' + Date.now();
+                showToast('Cập nhật avatar thành công', 'success');
+            } else showToast(data.message, 'danger');
+        } catch(e) { showToast('Lỗi upload ảnh', 'danger'); }
+    }
+    
+    // Refresh lại modal để cập nhật thông tin
+    setTimeout(() => renderProfileScreen(), 500);
+}
+
+async function savePreferences() {
+    const noteColor = document.getElementById('prefNoteColor').value;
+    const textColor = document.getElementById('prefTextColor').value;
+    const fontFamily = document.getElementById('prefFontFamily').value;
+    const fontSize = document.getElementById('prefFontSize').value;
+    const theme = document.getElementById('prefTheme').value;
+    
+    const fd = new FormData();
+    fd.append('note_color', noteColor);
+    fd.append('text_color', textColor);
+    fd.append('font_family', fontFamily);
+    fd.append('font_size', fontSize);
+    fd.append('theme_color', theme);
+    appendCsrfToken(fd);
+    
+    try {
+        const res = await fetch('api/update_preferences.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            // Áp dụng màu nền mặc định
+            document.documentElement.style.setProperty('--note-default-color', noteColor);
+            // Áp dụng màu chữ
+            document.documentElement.style.setProperty('--note-text-color', textColor);
+            // Áp dụng font chữ
+            document.body.style.fontFamily = fontFamily;
+            // Áp dụng cỡ chữ - set vào html để tránh bị CSS ghi đè
+            document.documentElement.style.fontSize = fontSize;
+            document.body.style.fontSize = fontSize; // fallback
+            // Áp dụng theme
+            applyTheme(theme);
+            
+            // Cập nhật tất cả các note card hiện có để đồng bộ giao diện
+            document.querySelectorAll('.note-card').forEach(card => {
+                // Đảm bảo font-size được kế thừa từ html
+                card.style.fontSize = '';
+                // Cập nhật màu chữ nếu card chưa có màu nền riêng
+                const titleEl = card.querySelector('.card-title');
+                const textEl = card.querySelector('.card-text');
+                if (titleEl && !card.style.backgroundColor) titleEl.style.color = textColor;
+                if (textEl && !card.style.backgroundColor) textEl.style.color = textColor;
+            });
+            
+            // Cập nhật modal nếu đang mở
+            const modalContent = document.getElementById('modalContentWrapper');
+            if (modalContent && getComputedStyle(modalContent).backgroundColor !== 'rgba(0, 0, 0, 0)') {
+                modalContent.style.setProperty('--note-text-color', textColor);
+                const modalTexts = modalContent.querySelectorAll('.modal-title, .modal-body, .form-label, p, span:not(.badge)');
+                modalTexts.forEach(el => el.style.color = textColor);
+            }
+            
+            // Cập nhật APP_CONFIG
+            window.APP_CONFIG.noteColor = noteColor;
+            window.APP_CONFIG.textColor = textColor;
+            window.APP_CONFIG.fontFamily = fontFamily;
+            window.APP_CONFIG.fontSize = fontSize;
+            window.APP_CONFIG.theme = theme;
+            
+            showToast('Đã lưu tùy chỉnh ghi chú', 'success');
+            profileGoTo('main');
+        } else {
+            showToast(data.message || 'Lỗi lưu cài đặt', 'danger');
+        }
+    } catch(e) {
+        showToast('Lỗi kết nối', 'danger');
+    }
+}
+
+function showForgotPasswordModal() {
+    showConfirm('Bạn muốn nhận OTP hay link reset qua email?', 
+        () => sendResetRequest('otp'),
+        () => sendResetRequest('link')
+    );
+}
+
+async function sendResetRequest(type) {
+    const email = window.APP_CONFIG?.email;
+    if (!email) return;
+    const fd = new FormData();
+    fd.append('email', email);
+    fd.append('type', type);
+    appendCsrfToken(fd);
+    try {
+        const res = await fetch('api/send_reset_code.php', { method: 'POST', body: fd });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Đã gửi ${type === 'otp' ? 'mã OTP' : 'link reset'} đến email của bạn`, 'success');
+        } else {
+            showToast(data.message, 'danger');
+        }
+    } catch(e) { showToast('Lỗi gửi yêu cầu', 'danger'); }
 }
 
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     localStorage.setItem('noteapp_theme', theme);
-    // Đảm bảo màu nền mặc định được giữ nguyên
-    const defaultColor = document.documentElement.style.getPropertyValue('--note-default-color');
-    if (defaultColor) {
-        document.documentElement.style.setProperty('--note-default-color', defaultColor);
-    }
 }
 
 // ====================== TIỆN ÍCH ======================
@@ -5032,7 +5823,6 @@ function changeColor(color) {
         .then(d => {
             if (d.success) {
                 showToast('Đã đổi màu ghi chú thành công', 'success');
-                // Broadcast color change via WebSocket
                 if (wsReady && currentNoteIdForWS == id) {
                     _wsSend({
                         type: 'color_update',
@@ -7140,7 +7930,7 @@ $user_avatar = !empty($_SESSION['avatar'])
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="assets/css/style.css">
-
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto:wght@300;400;500;700&family=Poppins:wght@300;400;500;600;700&family=Open+Sans:wght@300;400;500;600;700&family=Lato:wght@300;400;700&family=Montserrat:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body { 
             font-size: <?= htmlspecialchars($user_font_size) ?>; 
@@ -7148,10 +7938,15 @@ $user_avatar = !empty($_SESSION['avatar'])
         
         :root {
             --note-default-color: <?= htmlspecialchars($user_note_color) ?>;
+            --note-text-color: <?= htmlspecialchars($_SESSION['text_color'] ?? '#0A1024') ?>;
         }
         
         .note-card {
             background-color: var(--note-default-color) !important;
+        }
+        .note-card .card-title,
+        .note-card .card-text {
+            color: var(--note-text-color) !important;
         }
     </style>
 </head>
@@ -7166,10 +7961,10 @@ $user_avatar = !empty($_SESSION['avatar'])
         <div class="d-flex align-items-center gap-3">
             <span class="small d-none d-md-inline">Chào, <?= htmlspecialchars($_SESSION['display_name'] ?? 'Bạn') ?>!</span>
             <img src="<?= htmlspecialchars($user_avatar) ?>?v=<?= time() ?>" 
-                 class="nav-avatar rounded-circle" 
-                 onclick="new bootstrap.Modal(document.getElementById('profileModal')).show()" 
-                 title="Cài đặt tài khoản"
-                 style="width:32px;height:32px;object-fit:cover;cursor:pointer;">
+                class="nav-avatar rounded-circle" 
+                onclick="showProfileModal()" 
+                title="Cài đặt tài khoản"
+                style="width:32px;height:32px;object-fit:cover;cursor:pointer;">
             <a href="logout.php" class="btn btn-danger btn-sm">Thoát</a>
         </div>
     </div>
@@ -7208,6 +8003,9 @@ $user_avatar = !empty($_SESSION['avatar'])
         <button id="btnCreateNote" class="btn btn-primary shadow-sm px-4 fw-bold" onclick="openNoteModal()">
             <i class="bi bi-plus-lg"></i> Tạo ghi chú mới
         </button>
+        <button id="toggleBulkModeBtn" class="btn btn-outline-secondary shadow-sm px-3" title="Chọn nhiều ghi chú">
+            <i class="bi bi-check2-square"></i> Chọn
+        </button>
         <h4 id="viewTitle" class="text-secondary fw-bold m-0 align-self-center" style="display:none;"></h4>
         <div class="btn-group shadow-sm">
             <button class="btn btn-outline-secondary" onclick="setView('grid')"><i class="bi bi-grid"></i></button>
@@ -7216,6 +8014,17 @@ $user_avatar = !empty($_SESSION['avatar'])
     </div>
 
     <div id="notesContainer" class="note-grid-view pb-5"></div>
+    <!-- Bulk action toolbar (ẩn mặc định) -->
+<div id="bulkToolbar" class="fixed-bottom mb-3 d-none justify-content-center">
+    <div class="bg-body-tertiary rounded-pill shadow-lg p-2 d-flex gap-2">
+        <button id="bulkDeleteBtn" class="btn btn-sm btn-danger rounded-pill"><i class="bi bi-trash3"></i> Xóa</button>
+        <button id="bulkRestoreBtn" class="btn btn-sm btn-success rounded-pill d-none"><i class="bi bi-arrow-counterclockwise"></i> Khôi phục</button>
+        <button id="bulkPermanentBtn" class="btn btn-sm btn-dark rounded-pill d-none"><i class="bi bi-x-octagon"></i> Xóa vĩnh viễn</button>
+        <button id="bulkShareBtn" class="btn btn-sm btn-info rounded-pill"><i class="bi bi-share"></i> Chia sẻ</button>
+        <button id="bulkCancelBtn" class="btn btn-sm btn-secondary rounded-pill"><i class="bi bi-x-lg"></i> Hủy</button>
+        <span id="bulkCounter" class="align-self-center ms-2 small text-muted">0</span>
+    </div>
+</div>
 </div>
 
 <!-- ==================== MODALS ==================== -->
@@ -7227,10 +8036,18 @@ $user_avatar = !empty($_SESSION['avatar'])
 <!-- APP CONFIG -->
 <script>
     window.APP_CONFIG = {
-        userId:      <?= (int)($_SESSION['user_id'] ?? 0) ?>,
-        userName:    "<?= addslashes($_SESSION['display_name'] ?? 'User') ?>",
-        csrf_token:  "<?= $_SESSION['csrf_token'] ?? '' ?>"
-    };
+    userId:      <?= (int)($_SESSION['user_id'] ?? 0) ?>,
+    userName:    "<?= addslashes($_SESSION['display_name'] ?? 'User') ?>",
+    email:       "<?= addslashes($_SESSION['email'] ?? '') ?>",
+    displayName: "<?= addslashes($_SESSION['display_name'] ?? '') ?>",
+    avatar:      "<?= htmlspecialchars($user_avatar) ?>",
+    fontSize:    "<?= htmlspecialchars($user_font_size) ?>",
+    theme:       "<?= htmlspecialchars($user_theme) ?>",
+    noteColor:   "<?= htmlspecialchars($user_note_color) ?>",
+    textColor:   "<?= htmlspecialchars($_SESSION['text_color'] ?? '#0A1024') ?>",
+    fontFamily:  "<?= htmlspecialchars($_SESSION['font_family'] ?? 'Inter, system-ui, sans-serif') ?>",
+    csrf_token:  "<?= $_SESSION['csrf_token'] ?? '' ?>"
+};
 </script>
 
 <!-- Main JS -->
@@ -7291,7 +8108,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $_SESSION['font_size']    = $user['font_size'] ?? '16px';
                     $_SESSION['theme_color']  = $user['theme_color'] ?? 'light';
                     $_SESSION['note_color']   = $user['note_color'] ?? '#ffffff';
+                    $_SESSION['email']        = $user['email'];
+                    $_SESSION['text_color']   = $user['text_color'] ?? '#0A1024';
+                    $_SESSION['font_family']  = $user['font_family'] ?? 'Inter, system-ui, sans-serif';
                     $_SESSION['is_activated'] = (int)$user['is_activated'];
+                    
 
                     session_regenerate_id(true);
 
@@ -7733,50 +8554,20 @@ modals.php
     </div>
 </div>
 
-<!-- Modal Profile -->
-<div class="modal fade" id="profileModal" tabindex="-1">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content shadow">
-            <div class="modal-header">
-                <h5 class="modal-title fw-bold"><i class="bi bi-gear"></i> Cài đặt tài khoản</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+<!-- Modal Profile MỚI (thay thế hoàn toàn) -->
+<div class="modal fade" id="profileModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered modal-md">
+        <div class="modal-content shadow-lg" id="profileModalContent">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold" id="profileModalTitle">
+                    <i class="bi bi-person-circle"></i> Tài khoản
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
-            <div class="modal-body text-center">
-                <img id="previewAvatar" src="<?= htmlspecialchars($user_avatar) ?>" class="rounded-circle mb-3 border" style="width:120px;height:120px;object-fit:cover;">
-                <div class="mb-4">
-                    <label class="btn btn-outline-primary btn-sm rounded-pill px-3">
-                        <i class="bi bi-camera"></i> Đổi ảnh đại diện
-                        <input type="file" id="inputAvatar" hidden accept="image/*" onchange="previewImage(this)">
-                    </label>
+            <div class="modal-body p-4" id="profileModalBody">
+                <div class="text-center py-4">
+                    <div class="spinner-border text-primary" role="status"></div>
                 </div>
-                <hr>
-                <div class="row text-start g-3 mt-2">
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Kích thước chữ</label>
-                        <select id="settingFontSize" class="form-select">
-                            <option value="14px">Nhỏ</option>
-                            <option value="16px" selected>Vừa</option>
-                            <option value="18px">Lớn</option>
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Giao diện</label>
-                        <select id="settingTheme" class="form-select">
-                            <option value="light">Sáng</option>
-                            <option value="dark">Tối</option>
-                        </select>
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label fw-bold small text-muted">Màu ghi chú</label>
-                        <input type="color" id="settingNoteColor" class="form-control form-control-color w-100" value="<?= htmlspecialchars($user_note_color) ?>">
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer bg-body-tertiary">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
-                <button type="button" class="btn btn-success px-4" onclick="saveProfile()">
-                    <i class="bi bi-check2"></i> Lưu thay đổi
-                </button>
             </div>
         </div>
     </div>
@@ -7848,6 +8639,38 @@ modals.php
             <div class="modal-footer border-0">
                 <button type="button" class="btn btn-secondary" id="confirmCancelBtn">Hủy</button>
                 <button type="button" class="btn btn-danger" id="confirmOkBtn">Xác nhận</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal Bulk Share -->
+<div class="modal fade" id="bulkShareModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold"><i class="bi bi-share-fill"></i> Chia sẻ nhiều ghi chú</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Email người nhận (cách nhau bằng dấu phẩy)</label>
+                    <input type="text" id="bulkShareEmails" class="form-control" placeholder="user1@example.com, user2@example.com">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Quyền truy cập</label>
+                    <select id="bulkSharePermission" class="form-select">
+                        <option value="read">Chỉ xem</option>
+                        <option value="edit">Cho phép chỉnh sửa</option>
+                    </select>
+                </div>
+                <div class="alert alert-info small">
+                    <i class="bi bi-info-circle"></i> Ghi chú sẽ được chia sẻ đến tất cả email trên, với quyền được chọn.
+                </div>
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+                <button type="button" class="btn btn-primary" id="bulkShareConfirmBtn">Xác nhận chia sẻ</button>
             </div>
         </div>
     </div>
