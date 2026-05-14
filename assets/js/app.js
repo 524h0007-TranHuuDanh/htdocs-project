@@ -35,7 +35,33 @@ const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+function resetPasswordModalToDefault() {
+    const modal = document.getElementById('passwordModal');
+    if (!modal) return;
 
+    const bodyEl = modal.querySelector('.modal-body');
+    const footerEl = modal.querySelector('.modal-footer');
+
+    if (!bodyEl || !footerEl) return;
+
+    // Khôi phục body về trạng thái nhập mật khẩu mặc định
+    bodyEl.innerHTML = `
+        <input type="password" id="notePasswordInput" class="form-control" placeholder="Nhập mật khẩu..." autocomplete="current-password">
+        <div id="passwordError" class="text-danger mt-2 small" style="display:none;"></div>
+    `;
+
+    // Khôi phục footer về nút mặc định
+    footerEl.innerHTML = `
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+        <button type="button" id="passwordModalConfirmBtn" class="btn btn-primary">Xác nhận</button>
+    `;
+
+    // Gắn lại sự kiện cho nút xác nhận
+    const confirmBtn = document.getElementById('passwordModalConfirmBtn');
+    if (confirmBtn) {
+        confirmBtn.onclick = submitNotePassword;
+    }
+}
 function appendCsrfToken(formData) {
     formData.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
 }
@@ -86,7 +112,10 @@ document.addEventListener('DOMContentLoaded', () => {
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
     customAlertModal   = new bootstrap.Modal(document.getElementById('customAlertModal'));
     customConfirmModal = new bootstrap.Modal(document.getElementById('customConfirmModal'));
-
+    const passwordModalEl = document.getElementById('passwordModal');
+    if (passwordModalEl) {
+        passwordModalEl.addEventListener('hidden.bs.modal', resetPasswordModalToDefault);
+    }
     // --- Khởi tạo view ---
     setViewMode('my_notes');
 
@@ -324,32 +353,67 @@ function renderNotes(notes) {
 
 // ====================== MỞ GHI CHÚ & PASSWORD ======================
 function handleNoteOpen(id, title, content, isLocked, color, permission, ownerName) {
-    currentNoteId     = id;
+    // Kiểm tra modal tồn tại
+    const noteIdInput = document.getElementById('noteId');
+    if (!noteIdInput) {
+        console.error('Modal chưa sẵn sàng. Reload trang...');
+        location.reload();
+        return;
+    }
+
+    currentNoteId = id;
     currentPermission = permission;
 
     if (isLocked && currentViewMode !== 'trash') {
-        document.getElementById('passwordModalTitle').textContent = '🔒 Ghi chú đã bị khóa';
-        document.getElementById('notePasswordInput').value        = '';
-        document.getElementById('passwordError').style.display    = 'none';
+        // Reset modal password về trạng thái mặc định TRƯỚC KHI SHOW
+        resetPasswordModalToDefault();
+
+        const modalTitle = document.getElementById('passwordModalTitle');
+        if (modalTitle) modalTitle.textContent = '🔒 Ghi chú đã bị khóa';
+
+        const pwdInput = document.getElementById('notePasswordInput');
+        if (pwdInput) pwdInput.value = '';
+
+        const errorEl = document.getElementById('passwordError');
+        if (errorEl) errorEl.style.display = 'none';
+
         window.tempOpenData = { id, title, content, color, permission, ownerName };
         passwordModalInstance.show();
-        setTimeout(() => document.getElementById('notePasswordInput').focus(), 500);
+
+        setTimeout(() => {
+            const input = document.getElementById('notePasswordInput');
+            if (input) input.focus();
+        }, 500);
     } else {
         openNoteModal(id, title, content, color, permission, ownerName);
     }
 }
 
 function submitNotePassword() {
-    const password = document.getElementById('notePasswordInput').value.trim();
-    const errorEl  = document.getElementById('passwordError');
+    let pwdInput = document.getElementById('notePasswordInput');
+    if (!pwdInput) {
+        console.error('[submitNotePassword] Input mật khẩu không tồn tại! Khôi phục modal...');
+        resetPasswordModalToDefault();
+        pwdInput = document.getElementById('notePasswordInput');
+        if (!pwdInput) {
+            showAlert('Lỗi giao diện, vui lòng tải lại trang.', 'danger');
+            return;
+        }
+    }
+
+    const password = pwdInput.value.trim();
+    const errorEl = document.getElementById('passwordError');
     if (!password) {
-        errorEl.textContent   = 'Vui lòng nhập mật khẩu!';
-        errorEl.style.display = 'block';
+        if (errorEl) {
+            errorEl.textContent = 'Vui lòng nhập mật khẩu!';
+            errorEl.style.display = 'block';
+        }
+        pwdInput.focus();
         return;
     }
 
     const fd = new FormData();
-    fd.append('note_id',  currentNoteId);
+    fd.append('note_id', currentNoteId);
     fd.append('password', password);
     appendCsrfToken(fd);
 
@@ -366,10 +430,18 @@ function submitNotePassword() {
                     window.tempOpenData.ownerName
                 );
             } else {
-                errorEl.textContent   = d.message || 'Mật khẩu không đúng!';
+                if (errorEl) {
+                    errorEl.textContent = d.message || 'Mật khẩu không đúng!';
+                    errorEl.style.display = 'block';
+                }
+                pwdInput.value = '';
+                pwdInput.focus();
+            }
+        })
+        .catch(() => {
+            if (errorEl) {
+                errorEl.textContent = 'Lỗi kết nối!';
                 errorEl.style.display = 'block';
-                document.getElementById('notePasswordInput').value = '';
-                document.getElementById('notePasswordInput').focus();
             }
         });
 }
@@ -896,8 +968,8 @@ function _showChangePasswordModal(id, oldPw) {
 }
 
 function _openPasswordModal(config) {
-    const titleEl  = document.getElementById('passwordModalTitle');
-    const bodyEl   = document.getElementById('passwordModal').querySelector('.modal-body');
+    const titleEl = document.getElementById('passwordModalTitle');
+    const bodyEl = document.getElementById('passwordModal').querySelector('.modal-body');
     const footerEl = document.getElementById('passwordModal').querySelector('.modal-footer');
 
     titleEl.textContent = config.title;
@@ -912,10 +984,10 @@ function _openPasswordModal(config) {
     const errorEl = document.getElementById('pm_error');
 
     function showError(msg) {
-        errorEl.textContent   = msg;
+        errorEl.textContent = msg;
         errorEl.style.display = 'block';
         footerEl.querySelectorAll('.pm-action-btn').forEach(b => {
-            b.disabled    = false;
+            b.disabled = false;
             b.textContent = b.dataset.origLabel;
         });
     }
@@ -929,18 +1001,33 @@ function _openPasswordModal(config) {
             btn.textContent = 'Đang xử lý...';
 
             Promise.resolve(config.onConfirm(vals, showError, btn.dataset.action))
-                .then(shouldClose => { if (shouldClose === true) passwordModalInstance.hide(); })
+                .then(shouldClose => {
+                    if (shouldClose === true) {
+                        passwordModalInstance.hide();
+                        // Reset modal password về dạng nhập mật khẩu mở note
+                        resetPasswordModalToDefault();
+                        liveSearch();
+                    }
+                })
                 .catch(() => { showError('Lỗi kết nối, vui lòng thử lại!'); });
         });
     });
 
-    document.getElementById('passwordModal').addEventListener('shown.bs.modal', function onShown() {
-        document.getElementById(config.fields[0].id)?.focus();
-    }, { once: true });
+    // Khi modal bị đóng bằng nút Hủy hoặc dấu X, cũng reset lại
+    const modalEl = document.getElementById('passwordModal');
+    const onHidden = () => {
+        resetPasswordModalToDefault();
+        modalEl.removeEventListener('hidden.bs.modal', onHidden);
+    };
+    modalEl.addEventListener('hidden.bs.modal', onHidden);
 
     passwordModalInstance.show();
-}
 
+    setTimeout(() => {
+        const firstField = document.getElementById(config.fields[0]?.id);
+        if (firstField) firstField.focus();
+    }, 100);
+}
 // ====================== XÓA GHI CHÚ ======================
 function deleteNote(action) {
     const id = document.getElementById('noteId').value;

@@ -41,6 +41,8 @@ api - auth_helper.php
 |   - upload_image.php
 |   |
 |   - verify_note.php
+|   |
+|   - ws_token.php
 |
 App - NoteWebSocket.php
 |
@@ -52,6 +54,8 @@ uploads - avatars
 vendor // đã cài đặt
 |
 websocket - server.php
+|         |
+|         - ws_secret.php
 |
 activate.php
 |
@@ -113,6 +117,36 @@ function check_login() {
         header("Location: login.php");
         exit();
     }
+    ensure_session_csrf_token();
+}
+
+/**
+ * Ensures a session-bound CSRF secret exists for authenticated flows.
+ */
+function ensure_session_csrf_token(): void {
+    if (empty($_SESSION['csrf_token']) || !is_string($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+}
+
+/**
+ * Rejects POST when CSRF token is missing, wrong type, or not hash_equals to session value.
+ */
+function require_valid_csrf_post(): void {
+    $sent = $_POST['csrf_token'] ?? null;
+    $sess  = $_SESSION['csrf_token'] ?? null;
+    if (!is_string($sess) || $sess === '' || !is_string($sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ (CSRF).']);
+        exit;
+    }
+    if (!hash_equals($sess, $sent)) {
+        http_response_code(403);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ (CSRF).']);
+        exit;
+    }
 }
 //----//
 
@@ -122,6 +156,9 @@ change_color.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json; charset=utf-8');
 
 $id = $_POST['id'] ?? 0;
 $color = $_POST['color'] ?? '';
@@ -359,8 +396,10 @@ try {
 get_notes.php
 //codee//
 <?php
-session_start();
+require_once 'auth_helper.php';
 require_once '../database.php';
+
+check_login();   
 
 header('Content-Type: application/json');
 
@@ -703,6 +742,13 @@ $action = $_REQUEST['action'] ?? 'list';
 
 header('Content-Type: application/json');
 
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST'
+    && in_array($action, ['add', 'rename', 'delete'], true)
+) {
+    require_valid_csrf_post();
+}
+
 try {
     if ($action == 'list') {
         $stmt = $pdo->prepare("SELECT * FROM labels WHERE user_id = ? ORDER BY name");
@@ -751,6 +797,9 @@ pin_note.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json; charset=utf-8');
 
 $user_id = $_SESSION['user_id'];
 $id = $_POST['id'] ?? '';
@@ -778,6 +827,9 @@ restore_note.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json; charset=utf-8');
 
 $id = $_POST['id'] ?? 0;
 $stmt = $pdo->prepare("UPDATE notes SET is_trashed = 0 WHERE id = ? AND user_id = ?");
@@ -795,6 +847,7 @@ revoke_share.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
 
 header('Content-Type: application/json');
 
@@ -824,6 +877,7 @@ require_once 'auth_helper.php';
 require_once '../database.php';
 
 check_login();
+require_valid_csrf_post();
 
 header('Content-Type: application/json');
 
@@ -899,6 +953,8 @@ try {
     $stmt = $pdo->prepare("
         SELECT
             n.version,
+            n.title,
+            n.content,
             n.user_id,
             (
                 SELECT permission
@@ -936,44 +992,67 @@ try {
     }
 
     // =========================================================
-    // VERSION CONFLICT CHECK
+    // VERSION CHECK + ATOMIC UPDATE (optimistic locking)
+    // Client must match current server version; UPDATE only if row still at that version.
     // =========================================================
-    if (
-        $client_version > 0 &&
-        $client_version < ($note['version'] - 3)
-    ) {
+    $serverVersion = (int) $note['version'];
+
+    if ((int) $client_version !== $serverVersion) {
 
         echo json_encode([
-            'success'  => false,
-            'conflict' => true,
-            'version'  => $note['version'],
-            'message'  => 'Có xung đột phiên bản. Đang tải lại ghi chú...'
+            'success'          => false,
+            'conflict'         => true,
+            'version'          => $serverVersion,
+            'latest_title'     => $note['title'] ?? '',
+            'latest_content'   => $note['content'] ?? '',
+            'message'          => 'Có xung đột phiên bản. Đang tải lại ghi chú...'
         ]);
 
         exit;
     }
-
-    // =========================================================
-    // UPDATE NOTE
-    // =========================================================
-    $new_version = $note['version'] + 1;
 
     $stmt = $pdo->prepare("
         UPDATE notes
         SET
             title = ?,
             content = ?,
-            version = ?,
+            version = version + 1,
             updated_at = NOW()
         WHERE id = ?
+          AND version = ?
     ");
 
     $stmt->execute([
         $title,
         $content,
-        $new_version,
-        $id
+        $id,
+        $serverVersion
     ]);
+
+    if ($stmt->rowCount() === 0) {
+
+        $stmtFresh = $pdo->prepare("
+            SELECT version, title, content
+            FROM notes
+            WHERE id = ?
+            LIMIT 1
+        ");
+        $stmtFresh->execute([$id]);
+        $fresh = $stmtFresh->fetch(PDO::FETCH_ASSOC) ?: [];
+
+        echo json_encode([
+            'success'          => false,
+            'conflict'         => true,
+            'version'          => (int) ($fresh['version'] ?? $serverVersion),
+            'latest_title'     => $fresh['title'] ?? '',
+            'latest_content'   => $fresh['content'] ?? '',
+            'message'          => 'Ghi chú đã được cập nhật bởi người khác. Đang đồng bộ...'
+        ]);
+
+        exit;
+    }
+
+    $new_version = $serverVersion + 1;
 
     broadcastNoteUpdate(
         $id,
@@ -1010,9 +1089,27 @@ function broadcastNoteUpdate(
     $version,
     $user_name
 ) {
+    global $pdo;
 
-    // WebSocket server sẽ xử lý ở đây
+    // Ratchet relays typing with DB version per message; verify row matches expected version after save.
+    if (!isset($pdo) || !($pdo instanceof \PDO)) {
+        return;
+    }
 
+    $id       = (int) $note_id;
+    $expected = (int) $version;
+
+    if ($id <= 0 || $expected < 1) {
+        return;
+    }
+
+    $stmt = $pdo->prepare('SELECT version FROM notes WHERE id = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $actual = (int) $stmt->fetchColumn();
+
+    if ($actual !== $expected) {
+        error_log("broadcastNoteUpdate: version mismatch note={$id} expected={$expected} db={$actual}");
+    }
 }
 ?>
 //----//
@@ -1127,6 +1224,9 @@ set_note_label.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
+
+header('Content-Type: application/json; charset=utf-8');
 
 $note_id = $_POST['note_id'] ?? 0;
 $label_id = $_POST['label_id'] ?? 0;
@@ -1238,15 +1338,13 @@ try {
 update_profile.php
 //code//
 <?php
-/**
- * API: Cập nhật thông tin profile người dùng
- * Đã cải tiến: CSRF, Security, Validation, Error Handling
- */
+require_once 'auth_helper.php';
+require_once '../database.php';
 
-session_start();
+check_login();
+require_valid_csrf_post();   
+
 header('Content-Type: application/json');
-
-require_once __DIR__ . '/../database.php';
 
 // ====================== SECURITY CHECK ======================
 if (!isset($_SESSION['user_id']) || empty($_SESSION['user_id'])) {
@@ -1391,97 +1489,6 @@ try {
 }
 //----//
 
-upload_image.php
-//code//
-<?php
-// api/upload_image.php
-// SỬA WARN: Dùng finfo_file() kiểm tra MIME server-side thay vì tin $_FILES['type']
-require_once 'auth_helper.php';
-require_once '../database.php';
-check_login();
-
-header('Content-Type: application/json');
-
-if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_FILES['image']) || !isset($_POST['note_id'])) {
-    echo json_encode(['success' => false, 'message' => 'Yêu cầu không hợp lệ.']);
-    exit;
-}
-
-$note_id = intval($_POST['note_id']);
-$user_id = $_SESSION['user_id'];
-$file    = $_FILES['image'];
-
-// Kiểm tra lỗi upload
-if ($file['error'] !== UPLOAD_ERR_OK) {
-    echo json_encode(['success' => false, 'message' => 'Lỗi upload file (code: ' . $file['error'] . ').']);
-    exit;
-}
-
-// Kiểm tra note_id có thuộc về user này không (hoặc được share với quyền edit)
-$meStmt = $pdo->prepare("SELECT email FROM users WHERE id = ?");
-$meStmt->execute([$user_id]);
-$my_email = $meStmt->fetchColumn();
-
-$noteCheck = $pdo->prepare(
-    "SELECT id FROM notes WHERE id = ? AND user_id = ?
-     UNION
-     SELECT n.id FROM notes n
-     JOIN shared_notes sn ON sn.note_id = n.id
-     WHERE n.id = ? AND sn.recipient_email = ? AND sn.permission = 'edit'"
-);
-$noteCheck->execute([$note_id, $user_id, $note_id, $my_email]);
-if (!$noteCheck->fetch()) {
-    echo json_encode(['success' => false, 'message' => 'Bạn không có quyền thêm ảnh vào ghi chú này.']);
-    exit;
-}
-
-// Giới hạn kích thước file: 5MB
-$max_size = 5 * 1024 * 1024;
-if ($file['size'] > $max_size) {
-    echo json_encode(['success' => false, 'message' => 'File quá lớn. Tối đa 5MB.']);
-    exit;
-}
-
-// SỬA: Kiểm tra MIME type phía server bằng finfo (không tin client)
-$finfo     = finfo_open(FILEINFO_MIME_TYPE);
-$mime_type = finfo_file($finfo, $file['tmp_name']);
-finfo_close($finfo);
-
-$allowed_mimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-if (!in_array($mime_type, $allowed_mimes)) {
-    echo json_encode(['success' => false, 'message' => 'Chỉ cho phép file ảnh (jpg, png, gif, webp).']);
-    exit;
-}
-
-// Map MIME -> extension an toàn
-$ext_map   = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/gif' => 'gif', 'image/webp' => 'webp'];
-$extension = $ext_map[$mime_type];
-
-// Tạo tên file duy nhất
-$new_filename = uniqid('img_', true) . '.' . $extension;
-$upload_dir   = '../uploads/';
-$upload_path  = $upload_dir . $new_filename;
-$db_path      = 'uploads/' . $new_filename;
-
-// Tạo thư mục nếu chưa có
-if (!is_dir($upload_dir)) {
-    mkdir($upload_dir, 0755, true);
-}
-
-if (move_uploaded_file($file['tmp_name'], $upload_path)) {
-    $stmt = $pdo->prepare("INSERT INTO note_images (note_id, file_path) VALUES (?, ?)");
-    $stmt->execute([$note_id, $db_path]);
-
-    echo json_encode([
-        'success'  => true,
-        'file_path' => $db_path,
-        'image_id' => $pdo->lastInsertId()
-    ]);
-} else {
-    echo json_encode(['success' => false, 'message' => 'Không thể lưu file vào thư mục uploads.']);
-}
-//----//
-
 verify_note.php
 //code//
 <?php
@@ -1490,6 +1497,7 @@ verify_note.php
 require_once 'auth_helper.php';
 require_once '../database.php';
 check_login();
+require_valid_csrf_post();
 
 header('Content-Type: application/json');
 
@@ -1540,143 +1548,607 @@ try {
     echo json_encode(['success' => false, 'message' => 'Lỗi: ' . $e->getMessage()]);
 }
 //----//
+WS_token.php
+//code//
+<?php
+/**
+ * Short-lived signed token for WebSocket auth (session-bound; not sent with page HTML).
+ */
+require_once __DIR__ . '/auth_helper.php';
+require_once __DIR__ . '/../database.php';
+
+header('Content-Type: application/json');
+
+if (!is_logged_in()) {
+    echo json_encode(['success' => false, 'message' => 'Chưa đăng nhập']);
+    exit;
+}
+
+$cfg    = require __DIR__ . '/../websocket/ws_secret.php';
+$secret = $cfg['secret'] ?? '';
+
+if ($secret === '') {
+    echo json_encode(['success' => false, 'message' => 'WS chưa cấu hình']);
+    exit;
+}
+
+$userId = (int) ($_SESSION['user_id'] ?? 0);
+if ($userId <= 0) {
+    echo json_encode(['success' => false, 'message' => 'Phiên không hợp lệ']);
+    exit;
+}
+
+$exp     = time() + 600;
+$payload = json_encode(
+    [
+        'uid'   => $userId,
+        'exp'   => $exp,
+        'nonce' => bin2hex(random_bytes(8)),
+    ],
+    JSON_UNESCAPED_SLASHES
+);
+
+$sig   = hash_hmac('sha256', $payload, $secret, true);
+$token = rtrim(strtr(base64_encode($payload), '+/', '-_'), '=')
+    . '.'
+    . rtrim(strtr(base64_encode($sig), '+/', '-_'), '=');
+
+echo json_encode([
+    'success' => true,
+    'token'   => $token,
+    'exp'     => $exp,
+]);
+
+//----//
 
 Thư mục App
 
 NoteWebSocket.php
 //code//
 <?php
+
 namespace App;
 
+
+
+use PDO;
+
 use Ratchet\MessageComponentInterface;
+
 use Ratchet\ConnectionInterface;
 
+
+
 class NoteWebSocket implements MessageComponentInterface {
+
     protected $clients;
+
     protected $noteSubscriptions = []; // note_id => [resourceId => ['conn' => conn, 'user_name' => str]]
 
-    public function __construct() {
-        $this->clients = new \SplObjectStorage;
+    /** @var PDO */
+
+    protected $pdo;
+
+    protected $wsSecret;
+
+
+
+    public function __construct(PDO $pdo, string $wsSecret) {
+
+        $this->clients   = new \SplObjectStorage;
+
+        $this->pdo       = $pdo;
+
+        $this->wsSecret  = $wsSecret;
+
     }
+
+
 
     public function onOpen(ConnectionInterface $conn) {
+
         $this->clients->attach($conn);
+
         $conn->send(json_encode(['type' => 'ping']));
+
         $conn->user_id   = 0;
+
         $conn->user_name = 'Unknown';
+
         echo "[WS] New connection: {$conn->resourceId}\n";
+
     }
 
+
+
     public function onMessage(ConnectionInterface $from, $msg) {
+
         $data = json_decode($msg, true);
+
         if (!$data || !isset($data['type'])) return;
+
+
 
         switch ($data['type']) {
 
+
+
             case 'auth':
-                $uid  = intval($data['user_id'] ?? 0);
-                $name = $data['user_name'] ?? 'User';
-                if ($uid > 0) {
-                    $from->user_id   = $uid;
-                    $from->user_name = $name;
-                    $from->send(json_encode(['type' => 'auth_success']));
-                    echo "[WS] User $uid ($name) authenticated\n";
-                }
+
+                $this->handleAuth($from, $data);
+
                 break;
+
+
 
             case 'join_note':
-                $note_id = intval($data['note_id'] ?? 0);
-                if ($note_id && $from->user_id > 0) {
-                    // Thêm vào phòng
-                    $this->noteSubscriptions[$note_id][$from->resourceId] = [
-                        'conn'      => $from,
-                        'user_name' => $from->user_name
-                    ];
-                    echo "[WS] User {$from->user_id} joined note $note_id\n";
 
-                    // Broadcast danh sách người đang xem
-                    $this->broadcastPresence($note_id);
-                }
+                $this->handleJoinNote($from, $data);
+
                 break;
+
+
 
             case 'leave_note':
+
                 $note_id = intval($data['note_id'] ?? 0);
+
                 $this->removeFromNote($from, $note_id);
+
                 break;
+
+
 
             case 'update':
-                $note_id = intval($data['note_id'] ?? 0);
-                if ($note_id && isset($this->noteSubscriptions[$note_id])) {
 
-                    $broadcastData = [
-                        'type'       => 'update',
-                        'note_id'    => $note_id,
-                        'user_name'  => $from->user_name,
-                        'title'      => $data['title'] ?? null,
-                        'content'    => $data['content'] ?? null,
-                        'sender_id'  => $from->resourceId,
-                        'timestamp'  => time()
-                    ];
+                $this->handleUpdate($from, $data);
 
-                    // Broadcast cho tất cả người KHÁC trong note (không echo lại người gửi)
-                    foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
-                        if ($info['conn'] !== $from) {
-                            $info['conn']->send(json_encode($broadcastData));
-                        }
-                    }
-                }
                 break;
+
         }
+
     }
+
+
 
     /**
-     * Broadcast danh sách người đang xem ghi chú
+
+     * Verify HMAC token; bind identity from DB (ignore client-supplied user_id / user_name).
+
      */
+
+    private function handleAuth(ConnectionInterface $from, array $data) {
+
+        $token = $data['token'] ?? '';
+
+        if (!is_string($token) || $token === '') {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Thiếu token']));
+
+            return;
+
+        }
+
+
+
+        $uid = $this->verifyWsToken($token);
+
+        if ($uid === null) {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Token không hợp lệ hoặc đã hết hạn']));
+
+            return;
+
+        }
+
+
+
+        $stmt = $this->pdo->prepare('SELECT id, display_name FROM users WHERE id = ? LIMIT 1');
+
+        $stmt->execute([$uid]);
+
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+
+
+        if (!$row) {
+
+            $from->send(json_encode(['type' => 'auth_error', 'message' => 'Người dùng không tồn tại']));
+
+            return;
+
+        }
+
+
+
+        $from->user_id   = (int) $row['id'];
+
+        $from->user_name = $row['display_name'] !== '' && $row['display_name'] !== null
+
+            ? $row['display_name']
+
+            : 'User';
+
+
+
+        $from->send(json_encode(['type' => 'auth_success']));
+
+        echo "[WS] User {$from->user_id} ({$from->user_name}) authenticated via token\n";
+
+    }
+
+
+
+    /**
+
+     * @return int|null user id on success
+
+     */
+
+    private function verifyWsToken(string $token) {
+
+        $parts = explode('.', $token, 2);
+
+        if (count($parts) !== 2) {
+
+            return null;
+
+        }
+
+
+
+        list($payloadB64, $sigB64) = $parts;
+
+        $payloadJson = base64_decode(strtr($payloadB64, '-_', '+/'), true);
+
+        if ($payloadJson === false || $payloadJson === '') {
+
+            return null;
+
+        }
+
+
+
+        $expectedSig = hash_hmac('sha256', $payloadJson, $this->wsSecret, true);
+
+        $sig         = base64_decode(strtr($sigB64, '-_', '+/'), true);
+
+        if (!is_string($sig) || !hash_equals($expectedSig, $sig)) {
+
+            return null;
+
+        }
+
+
+
+        $payload = json_decode($payloadJson, true);
+
+        if (!is_array($payload) || empty($payload['uid']) || empty($payload['exp'])) {
+
+            return null;
+
+        }
+
+
+
+        if ((int) $payload['exp'] < time()) {
+
+            return null;
+
+        }
+
+
+
+        return (int) $payload['uid'];
+
+    }
+
+
+
+    private function handleJoinNote(ConnectionInterface $from, array $data) {
+
+        $note_id = intval($data['note_id'] ?? 0);
+
+        if (!$note_id || $from->user_id <= 0) {
+
+            return;
+
+        }
+
+
+
+        if (!$this->userCanAccessNote((int) $from->user_id, $note_id)) {
+
+            $from->send(json_encode([
+
+                'type'    => 'join_denied',
+
+                'note_id' => $note_id,
+
+                'message' => 'Không có quyền tham gia ghi chú này',
+
+            ]));
+
+            echo "[WS] join_denied user={$from->user_id} note=$note_id\n";
+
+            return;
+
+        }
+
+
+
+        $this->noteSubscriptions[$note_id][$from->resourceId] = [
+
+            'conn'      => $from,
+
+            'user_name' => $from->user_name,
+
+        ];
+
+        echo "[WS] User {$from->user_id} joined note $note_id\n";
+
+
+
+        $this->broadcastPresence($note_id);
+
+    }
+
+
+
+    /**
+
+     * Owner or any active share recipient (same rules as viewing note).
+
+     */
+
+    private function userCanAccessNote(int $userId, int $noteId) {
+
+        $sql = 'SELECT 1 FROM notes n WHERE n.id = ? AND n.is_trashed = 0 AND (
+
+            n.user_id = ?
+
+            OR EXISTS (
+
+                SELECT 1 FROM shared_notes sn
+
+                INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
+
+                WHERE sn.note_id = n.id
+
+            )
+
+        ) LIMIT 1';
+
+        $st = $this->pdo->prepare($sql);
+
+        $st->execute([$noteId, $userId, $userId]);
+
+        return (bool) $st->fetchColumn();
+
+    }
+
+
+
+    /** Owner or shared with edit permission (matches client realtime for editors). */
+
+    private function userCanEditNote(int $userId, int $noteId) {
+
+        $st = $this->pdo->prepare('SELECT 1 FROM notes WHERE id = ? AND user_id = ? LIMIT 1');
+
+        $st->execute([$noteId, $userId]);
+
+        if ($st->fetchColumn()) {
+
+            return true;
+
+        }
+
+
+
+        $st = $this->pdo->prepare(
+
+            "SELECT 1 FROM shared_notes sn
+
+             INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
+
+             WHERE sn.note_id = ? AND sn.permission = 'edit' LIMIT 1"
+
+        );
+
+        $st->execute([$userId, $noteId]);
+
+        return (bool) $st->fetchColumn();
+
+    }
+
+
+
+    /** Persisted notes.version (authoritative for optimistic HTTP saves). */
+
+    private function fetchAuthoritativeNoteVersion(int $noteId) {
+
+        $st = $this->pdo->prepare('SELECT version FROM notes WHERE id = ? AND is_trashed = 0 LIMIT 1');
+
+        $st->execute([$noteId]);
+
+        $v = $st->fetchColumn();
+
+        return $v !== false ? (int) $v : null;
+
+    }
+
+
+
+    private function handleUpdate(ConnectionInterface $from, array $data) {
+
+        $note_id = intval($data['note_id'] ?? 0);
+
+        if (
+
+            !$note_id
+
+            || !isset($this->noteSubscriptions[$note_id][$from->resourceId])
+
+        ) {
+
+            return;
+
+        }
+
+
+
+        if (!$this->userCanEditNote((int) $from->user_id, $note_id)) {
+
+            return;
+
+        }
+
+
+
+        $dbVersion = $this->fetchAuthoritativeNoteVersion($note_id);
+
+        if ($dbVersion === null) {
+
+            return;
+
+        }
+
+
+
+        $broadcastData = [
+
+            'type'       => 'update',
+
+            'note_id'    => $note_id,
+
+            'user_name'  => $from->user_name,
+
+            'title'      => $data['title'] ?? null,
+
+            'content'    => $data['content'] ?? null,
+
+            'version'    => $dbVersion,
+
+            'sender_id'  => $from->resourceId,
+
+            'timestamp'  => time(),
+
+        ];
+
+
+
+        foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
+
+            if ($info['conn'] !== $from) {
+
+                $info['conn']->send(json_encode($broadcastData));
+
+            }
+
+        }
+
+    }
+
+
+
+    /**
+
+     * Broadcast danh sách người đang xem ghi chú
+
+     */
+
     private function broadcastPresence(int $note_id) {
+
         if (!isset($this->noteSubscriptions[$note_id])) return;
 
+
+
         $users = array_values(array_map(
-            fn($info) => $info['user_name'],
+
+            function ($info) {
+
+                return $info['user_name'];
+
+            },
+
             $this->noteSubscriptions[$note_id]
+
         ));
 
+
+
         $payload = json_encode([
-            'type'     => 'presence',
-            'note_id'  => $note_id,
-            'users'    => $users
+
+            'type'    => 'presence',
+
+            'note_id' => $note_id,
+
+            'users'   => $users,
+
         ]);
 
+
+
         foreach ($this->noteSubscriptions[$note_id] as $info) {
+
             $info['conn']->send($payload);
+
         }
+
     }
+
+
 
     private function removeFromNote(ConnectionInterface $conn, int $note_id) {
+
         if ($note_id && isset($this->noteSubscriptions[$note_id])) {
+
             unset($this->noteSubscriptions[$note_id][$conn->resourceId]);
 
+
+
             if (empty($this->noteSubscriptions[$note_id])) {
+
                 unset($this->noteSubscriptions[$note_id]);
+
             } else {
+
                 $this->broadcastPresence($note_id);
+
             }
+
         }
+
     }
+
+
 
     public function onClose(ConnectionInterface $conn) {
-        // Xóa khỏi tất cả các note đang tham gia
+
         foreach (array_keys($this->noteSubscriptions) as $note_id) {
-            $this->removeFromNote($conn, (int)$note_id);
+
+            $this->removeFromNote($conn, (int) $note_id);
+
         }
+
         $this->clients->detach($conn);
+
         echo "[WS] Connection closed: {$conn->resourceId}\n";
+
     }
 
+
+
     public function onError(ConnectionInterface $conn, \Exception $e) {
+
         echo "[WS] Error: {$e->getMessage()}\n";
+
         $conn->close();
+
     }
+
 }
+
 
 //----//
 
@@ -2961,6 +3433,7 @@ h1, h2, h3, h4, h5, h6, p, span, div {
     filter: none !important;
     opacity: 0.75;
 }
+
 //----//
 
 app.js
@@ -2984,32 +3457,83 @@ let autoSaveBusyTimer      = null;
 let autoSaveInFlightSeq    = 0;
 let lastAutoSavePersistSig = '';
 let isSaving               = false;
+/** Coalesces list refresh after rapid autosaves (single search request). */
+let liveSearchAfterSaveTimer = null;
+/** True while applying server title/content+version after HTTP conflict; blocks autosave to avoid stale POSTs. */
+let noteConflictResolutionLock = false;
+/** True while GET api/get_notes.php (note_id) is in flight for an opened note; blocks autosave until response. */
+let noteVersionLoadPending = false;
+let noteVersionFetchGen    = 0;
+
+/** Offline queue sync: avoids tight retry loops and exposes status to the UI layer. */
+let offlineSyncIsRunning = false;
+const OFFLINE_SYNC_BASE_DELAY_MS = 2000;
+const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 
 // Bootstrap modals (khởi tạo sau DOM ready)
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+function resetPasswordModalToDefault() {
+    const modal = document.getElementById('passwordModal');
+    if (!modal) return;
 
+    const bodyEl = modal.querySelector('.modal-body');
+    const footerEl = modal.querySelector('.modal-footer');
+
+    if (!bodyEl || !footerEl) return;
+
+    // Khôi phục body về trạng thái nhập mật khẩu mặc định
+    bodyEl.innerHTML = `
+        <input type="password" id="notePasswordInput" class="form-control" placeholder="Nhập mật khẩu..." autocomplete="current-password">
+        <div id="passwordError" class="text-danger mt-2 small" style="display:none;"></div>
+    `;
+
+    // Khôi phục footer về nút mặc định
+    footerEl.innerHTML = `
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+        <button type="button" id="passwordModalConfirmBtn" class="btn btn-primary">Xác nhận</button>
+    `;
+
+    // Gắn lại sự kiện cho nút xác nhận
+    const confirmBtn = document.getElementById('passwordModalConfirmBtn');
+    if (confirmBtn) {
+        confirmBtn.onclick = submitNotePassword;
+    }
+}
 function appendCsrfToken(formData) {
     formData.append('csrf_token', window.APP_CONFIG?.csrf_token || '');
 }
 
+/** application/x-www-form-urlencoded bodies */
+function appendCsrfUrlEncoded(body) {
+    const raw = window.APP_CONFIG?.csrf_token || '';
+    const base = body == null ? '' : String(body);
+    const sep    = base.trim() !== '' ? '&' : '';
+    return `${base}${sep}csrf_token=${encodeURIComponent(raw)}`;
+}
+
 function getNoteContentVersion() {
     const contentEl = document.getElementById('noteContent');
-    return parseInt(contentEl?.dataset.version, 10) || 1;
+    const raw = contentEl?.dataset.version;
+    if (raw === undefined || raw === '') return NaN;
+    const v = parseInt(raw, 10);
+    return Number.isFinite(v) ? v : NaN;
 }
 
 function buildWsNoteUpdatePayload() {
     const titleEl = document.getElementById('noteTitle');
     const contentEl = document.getElementById('noteContent');
-    return {
+    const v = !noteVersionLoadPending ? getNoteContentVersion() : NaN;
+    const payload = {
         type:      'update',
         note_id:   currentNoteIdForWS,
         title:     (titleEl && titleEl.value) || '',
         content:   (contentEl && contentEl.value) || '',
-        version:   getNoteContentVersion(),
         user_name: currentUserName
     };
+    if (Number.isFinite(v)) payload.version = v;
+    return payload;
 }
 
 function setNoteOwnerToolbarVisible(visible) {
@@ -3027,7 +3551,10 @@ document.addEventListener('DOMContentLoaded', () => {
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
     customAlertModal   = new bootstrap.Modal(document.getElementById('customAlertModal'));
     customConfirmModal = new bootstrap.Modal(document.getElementById('customConfirmModal'));
-
+    const passwordModalEl = document.getElementById('passwordModal');
+    if (passwordModalEl) {
+        passwordModalEl.addEventListener('hidden.bs.modal', resetPasswordModalToDefault);
+    }
     // --- Khởi tạo view ---
     setViewMode('my_notes');
 
@@ -3168,6 +3695,14 @@ async function liveSearch() {
     }, 300);
 }
 
+function scheduleLiveSearchAfterSave() {
+    clearTimeout(liveSearchAfterSaveTimer);
+    liveSearchAfterSaveTimer = setTimeout(() => {
+        liveSearchAfterSaveTimer = null;
+        liveSearch();
+    }, 500);
+}
+
 // ====================== RENDER NOTES ======================
 function renderNotes(notes) {
     const container = document.getElementById('notesContainer');
@@ -3192,6 +3727,15 @@ function renderNotes(notes) {
         if (n.is_locked == 1) icons += '<i class="bi bi-lock-fill text-warning me-1" title="Đã khóa"></i>';
         if (ownerName)         icons += '<i class="bi bi-people-fill text-info me-1" title="Được chia sẻ"></i>';
         if (n.is_pinned == 1)  icons += '<i class="bi bi-pin-fill text-danger me-1" title="Đã ghim"></i>';
+
+        let offlineSyncBadge = '';
+        if (n.syncStatus === 'error' || n.lastSyncError) {
+            offlineSyncBadge = `<span class="badge bg-danger ms-1" title="${escapeHtml(n.lastSyncError || 'Lỗi đồng bộ')}">Chưa đồng bộ</span>`;
+        } else if (n.syncStatus === 'pending' && n.nextRetryAt && n.nextRetryAt > Date.now()) {
+            offlineSyncBadge = '<span class="badge bg-secondary ms-1" title="Đang chờ thử lại">Chờ thử lại</span>';
+        } else if (n.syncStatus === 'pending' || isNoteTemp(n.id)) {
+            offlineSyncBadge = '<span class="badge bg-warning text-dark ms-1">Chờ đồng bộ</span>';
+        }
 
         const shareInfo = ownerName ? `
             <div class="position-absolute bottom-0 start-0 end-0 px-3 pb-2 d-flex justify-content-between align-items-center">
@@ -3231,8 +3775,8 @@ function renderNotes(notes) {
                      onclick="event.stopPropagation(); togglePin(${n.id}, ${n.is_pinned == 1 ? 0 : 1})">
                      <i class="bi ${pinClass} fs-5"></i></button>`
                 : ''}
-            <h5 class="card-title text-truncate d-flex align-items-center gap-1">
-                ${icons} ${escapeHtml(n.title) || 'Không tiêu đề'}
+            <h5 class="card-title text-truncate d-flex align-items-center gap-1 flex-wrap">
+                ${icons} ${escapeHtml(n.title) || 'Không tiêu đề'} ${offlineSyncBadge}
             </h5>
             <p class="card-text text-muted text-truncate"
                style="white-space:pre-wrap; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical;">
@@ -3248,33 +3792,69 @@ function renderNotes(notes) {
 
 // ====================== MỞ GHI CHÚ & PASSWORD ======================
 function handleNoteOpen(id, title, content, isLocked, color, permission, ownerName) {
-    currentNoteId     = id;
+    // Kiểm tra modal tồn tại
+    const noteIdInput = document.getElementById('noteId');
+    if (!noteIdInput) {
+        console.error('Modal chưa sẵn sàng. Reload trang...');
+        location.reload();
+        return;
+    }
+
+    currentNoteId = id;
     currentPermission = permission;
 
     if (isLocked && currentViewMode !== 'trash') {
-        document.getElementById('passwordModalTitle').textContent = '🔒 Ghi chú đã bị khóa';
-        document.getElementById('notePasswordInput').value        = '';
-        document.getElementById('passwordError').style.display    = 'none';
+        // Reset modal password về trạng thái mặc định TRƯỚC KHI SHOW
+        resetPasswordModalToDefault();
+
+        const modalTitle = document.getElementById('passwordModalTitle');
+        if (modalTitle) modalTitle.textContent = '🔒 Ghi chú đã bị khóa';
+
+        const pwdInput = document.getElementById('notePasswordInput');
+        if (pwdInput) pwdInput.value = '';
+
+        const errorEl = document.getElementById('passwordError');
+        if (errorEl) errorEl.style.display = 'none';
+
         window.tempOpenData = { id, title, content, color, permission, ownerName };
         passwordModalInstance.show();
-        setTimeout(() => document.getElementById('notePasswordInput').focus(), 500);
+
+        setTimeout(() => {
+            const input = document.getElementById('notePasswordInput');
+            if (input) input.focus();
+        }, 500);
     } else {
         openNoteModal(id, title, content, color, permission, ownerName);
     }
 }
 
 function submitNotePassword() {
-    const password = document.getElementById('notePasswordInput').value.trim();
-    const errorEl  = document.getElementById('passwordError');
+    let pwdInput = document.getElementById('notePasswordInput');
+    if (!pwdInput) {
+        console.error('[submitNotePassword] Input mật khẩu không tồn tại! Khôi phục modal...');
+        resetPasswordModalToDefault();
+        pwdInput = document.getElementById('notePasswordInput');
+        if (!pwdInput) {
+            showAlert('Lỗi giao diện, vui lòng tải lại trang.', 'danger');
+            return;
+        }
+    }
+
+    const password = pwdInput.value.trim();
+    const errorEl = document.getElementById('passwordError');
     if (!password) {
-        errorEl.textContent   = 'Vui lòng nhập mật khẩu!';
-        errorEl.style.display = 'block';
+        if (errorEl) {
+            errorEl.textContent = 'Vui lòng nhập mật khẩu!';
+            errorEl.style.display = 'block';
+        }
+        pwdInput.focus();
         return;
     }
 
     const fd = new FormData();
-    fd.append('note_id',  currentNoteId);
+    fd.append('note_id', currentNoteId);
     fd.append('password', password);
+    appendCsrfToken(fd);
 
     fetch('api/verify_note.php', { method: 'POST', body: fd })
         .then(res => res.json())
@@ -3289,10 +3869,18 @@ function submitNotePassword() {
                     window.tempOpenData.ownerName
                 );
             } else {
-                errorEl.textContent   = d.message || 'Mật khẩu không đúng!';
+                if (errorEl) {
+                    errorEl.textContent = d.message || 'Mật khẩu không đúng!';
+                    errorEl.style.display = 'block';
+                }
+                pwdInput.value = '';
+                pwdInput.focus();
+            }
+        })
+        .catch(() => {
+            if (errorEl) {
+                errorEl.textContent = 'Lỗi kết nối!';
                 errorEl.style.display = 'block';
-                document.getElementById('notePasswordInput').value = '';
-                document.getElementById('notePasswordInput').focus();
             }
         });
 }
@@ -3305,22 +3893,46 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     document.getElementById('noteTitle').value   = title;
     document.getElementById('noteContent').value = content;
 
-    const contentEl           = document.getElementById('noteContent');
-    contentEl.dataset.version = '1';
+    const contentEl = document.getElementById('noteContent');
+    delete contentEl.dataset.version;
 
     document.getElementById('imagePreviewContainer').innerHTML = '';
     document.getElementById('noteLabelsContainer').innerHTML   = '';
     document.getElementById('saveStatus').innerText            = '';
     lastAutoSavePersistSig = '';
+    noteConflictResolutionLock = false;
     clearTimeout(autoSaveTimer);
     clearTimeout(autoSaveRetryTimer);
     clearTimeout(autoSaveBusyTimer);
+    clearTimeout(liveSearchAfterSaveTimer);
     clearTimeout(realtimeTypingTimer);
+    liveSearchAfterSaveTimer = null;
     autoSaveTimer          = null;
     autoSaveRetryTimer     = null;
     autoSaveBusyTimer      = null;
     realtimeTypingTimer    = null;
     autoSaveInFlightSeq++;
+
+    if (id) {
+        noteVersionLoadPending = true;
+        const fetchGen = ++noteVersionFetchGen;
+        fetch(`api/get_notes.php?note_id=${id}`)
+            .then(r => r.json())
+            .then(note => {
+                if (note != null && note.version != null && note.version !== '') {
+                    contentEl.dataset.version = String(note.version);
+                }
+            })
+            .catch(() => {})
+            .finally(() => {
+                if (fetchGen === noteVersionFetchGen) {
+                    noteVersionLoadPending = false;
+                }
+            });
+    } else {
+        noteVersionFetchGen++;
+        noteVersionLoadPending = false;
+    }
 
     // --- Áp dụng màu ghi chú ---
     const modalWrapper  = document.getElementById('modalContentWrapper');
@@ -3380,14 +3992,6 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
         }
     }
 
-    // --- Lấy version mới nhất từ server ---
-    if (id) {
-        fetch(`api/get_notes.php?note_id=${id}`)
-            .then(r => r.json())
-            .then(note => { if (note && note.version) contentEl.dataset.version = note.version; })
-            .catch(() => {});
-    }
-
     // --- Placeholder cho note mới ---
     if (!id) {
         document.getElementById('noteTitle').placeholder   = 'Nhập tiêu đề ghi chú...';
@@ -3412,6 +4016,8 @@ function startAutoRefresh() {
 
 function closeAndReload() {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    clearTimeout(liveSearchAfterSaveTimer);
+    liveSearchAfterSaveTimer = null;
     stopRealtime();
     noteModal.hide();
     liveSearch();
@@ -3430,20 +4036,25 @@ function _autoSavePayloadSignature() {
 function autoSave() {
     if (currentViewMode === 'trash' || currentPermission === 'read') return;
     if (window.__remoteUpdating) return;
+    if (noteConflictResolutionLock) return;
 
     const noteId  = document.getElementById('noteId').value;
+    if (noteId && noteVersionLoadPending) return;
     const title   = document.getElementById('noteTitle').value.trim();
     const content = document.getElementById('noteContent').value;
 
     if (!noteId && !title && !content) return;
 
-    document.getElementById('saveStatus').innerHTML = '<i class="bi bi-hourglass-split"></i> Đang lưu...';
-
+    const hadPendingDebounce = !!autoSaveTimer;
     clearTimeout(autoSaveTimer);
     clearTimeout(autoSaveRetryTimer);
     clearTimeout(autoSaveBusyTimer);
     autoSaveRetryTimer = null;
     autoSaveBusyTimer  = null;
+
+    if (!hadPendingDebounce) {
+        document.getElementById('saveStatus').innerHTML = '<i class="bi bi-hourglass-split"></i> Đang lưu...';
+    }
 
     autoSaveTimer = setTimeout(() => {
         autoSaveTimer = null;
@@ -3460,7 +4071,12 @@ function autoSave() {
             const tit  = document.getElementById('noteTitle').value.trim();
             const cont = document.getElementById('noteContent').value;
 
-            if (!nid && !tit && !cont) return;
+            if (!nid && !tit && !cont) {
+                document.getElementById('saveStatus').innerText = '';
+                return;
+            }
+
+            if (nid && noteVersionLoadPending) return;
 
             if (nid && _autoSavePayloadSignature() === lastAutoSavePersistSig) {
                 const statusEl = document.getElementById('saveStatus');
@@ -3472,11 +4088,12 @@ function autoSave() {
 
             // --- OFFLINE: lưu cục bộ ngay lập tức ---
             if (!navigator.onLine) {
+                const vOff = getNoteContentVersion();
                 const noteData = {
                     id:         nid || 'temp_' + Date.now(),
                     title:      tit,
                     content:    cont,
-                    version:    getNoteContentVersion(),
+                    version:    Number.isFinite(vOff) ? vOff : 1,
                     updated_at: new Date().toISOString()
                 };
                 saveNoteOffline(noteData);
@@ -3487,6 +4104,12 @@ function autoSave() {
             }
 
             // --- ONLINE: gửi lên server ---
+            const verNum = getNoteContentVersion();
+            if (nid && !Number.isFinite(verNum)) {
+                document.getElementById('saveStatus').innerText = '';
+                return;
+            }
+
             isSaving = true;
             const mySeq = ++autoSaveInFlightSeq;
 
@@ -3494,7 +4117,7 @@ function autoSave() {
             fd.append('id',      nid);
             fd.append('title',   tit);
             fd.append('content', cont);
-            fd.append('version', String(getNoteContentVersion()));
+            fd.append('version', nid ? String(verNum) : '1');
             appendCsrfToken(fd);
 
             fetch('api/save_note.php', { method: 'POST', body: fd })
@@ -3506,28 +4129,38 @@ function autoSave() {
                     const contentEl = document.getElementById('noteContent');
 
                     if (!d.success && d.conflict) {
-                        contentEl.dataset.version = d.version;
+                        clearTimeout(autoSaveRetryTimer);
+                        autoSaveRetryTimer = null;
 
+                        const titleEl = document.getElementById('noteTitle');
+                        const hasLatestTitle   = d.latest_title !== undefined;
+                        const hasLatestContent = d.latest_content !== undefined;
+
+                        noteConflictResolutionLock = true;
                         window.__remoteUpdating = true;
                         try {
-                            if (document.activeElement !== contentEl && d.latest_content !== undefined) {
+                            // Apply server fields first; only then bump version (never version without synced title+body).
+                            if (hasLatestTitle) {
+                                titleEl.value = d.latest_title;
+                            }
+                            if (hasLatestContent) {
                                 contentEl.value = d.latest_content;
                             }
-                            if (document.activeElement !== document.getElementById('noteTitle') && d.latest_title !== undefined) {
-                                document.getElementById('noteTitle').value = d.latest_title;
+                            if (hasLatestTitle && hasLatestContent &&
+                                d.version !== undefined && d.version !== null && d.version !== '') {
+                                contentEl.dataset.version = String(d.version);
                             }
+                            lastAutoSavePersistSig = _autoSavePayloadSignature();
                         } finally {
                             window.__remoteUpdating = false;
+                            noteConflictResolutionLock = false;
                         }
 
-                        statusEl.innerHTML = '<i class="bi bi-arrow-clockwise text-warning"></i> Đồng bộ xong';
-                        showToast('Đã cập nhật phiên bản mới nhất, đang lưu lại...', 'warning');
-
-                        clearTimeout(autoSaveRetryTimer);
-                        autoSaveRetryTimer = setTimeout(() => {
-                            autoSaveRetryTimer = null;
-                            autoSave();
-                        }, 1000);
+                        statusEl.innerHTML = '<i class="bi bi-arrow-clockwise text-warning"></i> Đồng bộ từ máy chủ';
+                        showToast(
+                            'Nội dung đã được đồng bộ với bản mới nhất trên máy chủ. Tiếp tục chỉnh sửa để lưu.',
+                            'warning'
+                        );
                         return;
                     }
 
@@ -3545,7 +4178,7 @@ function autoSave() {
                         }
 
                         lastAutoSavePersistSig = _autoSavePayloadSignature();
-                        liveSearch();
+                        scheduleLiveSearchAfterSave();
                     } else {
                         statusEl.innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> Lỗi lưu';
                         if (d.message) showToast(d.message, 'danger');
@@ -3560,7 +4193,7 @@ function autoSave() {
                         id:         nid || 'temp_' + Date.now(),
                         title:      tit,
                         content:    cont,
-                        version:    getNoteContentVersion(),
+                        version:    Number.isFinite(getNoteContentVersion()) ? getNoteContentVersion() : 1,
                         updated_at: new Date().toISOString()
                     };
                     saveNoteOffline(noteData);
@@ -3570,6 +4203,17 @@ function autoSave() {
                     if (mySeq === autoSaveInFlightSeq) {
                         isSaving = false;
                     }
+                    if (mySeq !== autoSaveInFlightSeq) return;
+                    setTimeout(() => {
+                        if (isSaving || autoSaveTimer) return;
+                        if (currentViewMode === 'trash' || currentPermission === 'read') return;
+                        if (noteVersionLoadPending) return;
+                        if (noteConflictResolutionLock) return;
+                        if (!navigator.onLine) return;
+                        if (_autoSavePayloadSignature() !== lastAutoSavePersistSig) {
+                            autoSave();
+                        }
+                    }, 0);
                 });
         };
 
@@ -3626,6 +4270,7 @@ function revokeShare(shareId) {
     showConfirm('Thu hồi quyền chia sẻ này?', () => {
         const fd = new FormData();
         fd.append('share_id', shareId);
+        appendCsrfToken(fd);
         fetch('api/revoke_share.php', { method: 'POST', body: fd })
             .then(r => r.json())
             .then(data => {
@@ -3762,8 +4407,8 @@ function _showChangePasswordModal(id, oldPw) {
 }
 
 function _openPasswordModal(config) {
-    const titleEl  = document.getElementById('passwordModalTitle');
-    const bodyEl   = document.getElementById('passwordModal').querySelector('.modal-body');
+    const titleEl = document.getElementById('passwordModalTitle');
+    const bodyEl = document.getElementById('passwordModal').querySelector('.modal-body');
     const footerEl = document.getElementById('passwordModal').querySelector('.modal-footer');
 
     titleEl.textContent = config.title;
@@ -3778,10 +4423,10 @@ function _openPasswordModal(config) {
     const errorEl = document.getElementById('pm_error');
 
     function showError(msg) {
-        errorEl.textContent   = msg;
+        errorEl.textContent = msg;
         errorEl.style.display = 'block';
         footerEl.querySelectorAll('.pm-action-btn').forEach(b => {
-            b.disabled    = false;
+            b.disabled = false;
             b.textContent = b.dataset.origLabel;
         });
     }
@@ -3795,18 +4440,33 @@ function _openPasswordModal(config) {
             btn.textContent = 'Đang xử lý...';
 
             Promise.resolve(config.onConfirm(vals, showError, btn.dataset.action))
-                .then(shouldClose => { if (shouldClose === true) passwordModalInstance.hide(); })
+                .then(shouldClose => {
+                    if (shouldClose === true) {
+                        passwordModalInstance.hide();
+                        // Reset modal password về dạng nhập mật khẩu mở note
+                        resetPasswordModalToDefault();
+                        liveSearch();
+                    }
+                })
                 .catch(() => { showError('Lỗi kết nối, vui lòng thử lại!'); });
         });
     });
 
-    document.getElementById('passwordModal').addEventListener('shown.bs.modal', function onShown() {
-        document.getElementById(config.fields[0].id)?.focus();
-    }, { once: true });
+    // Khi modal bị đóng bằng nút Hủy hoặc dấu X, cũng reset lại
+    const modalEl = document.getElementById('passwordModal');
+    const onHidden = () => {
+        resetPasswordModalToDefault();
+        modalEl.removeEventListener('hidden.bs.modal', onHidden);
+    };
+    modalEl.addEventListener('hidden.bs.modal', onHidden);
 
     passwordModalInstance.show();
-}
 
+    setTimeout(() => {
+        const firstField = document.getElementById(config.fields[0]?.id);
+        if (firstField) firstField.focus();
+    }, 100);
+}
 // ====================== XÓA GHI CHÚ ======================
 function deleteNote(action) {
     const id = document.getElementById('noteId').value;
@@ -3918,6 +4578,7 @@ function restoreNote() {
     const id = document.getElementById('noteId').value;
     const fd = new FormData();
     fd.append('id', id);
+    appendCsrfToken(fd);
     fetch('api/restore_note.php', { method: 'POST', body: fd })
         .then(() => { showAlert('Khôi phục thành công!', 'success'); closeAndReload(); });
 }
@@ -3960,117 +4621,157 @@ function connectWebSocket() {
     clearTimeout(wsReconnectTimer);
     wsReconnectTimer = null;
 
-    try {
-        ws = new WebSocket(WS_HOST);
-    } catch (e) {
-        console.warn('WebSocket không khả dụng, dùng fallback polling.');
+    if (!currentUserId) {
+        console.warn('WebSocket: chưa đăng nhập, dùng fallback polling.');
         _startFallbackPolling();
         return;
     }
 
-    const socket = ws;
-
-    socket.onopen = () => {
-        if (ws !== socket) return;
-        clearTimeout(wsReconnectTimer);
-        wsReconnectTimer = null;
-        _stopFallbackPolling();
-        socket.send(JSON.stringify({ type: 'auth', user_id: currentUserId, user_name: currentUserName }));
-        _setWsStatus('connecting');
-    };
-
-    socket.onmessage = (event) => {
-        if (ws !== socket) return;
-        try {
-            const data = JSON.parse(event.data);
-
-            if (data.type === 'auth_success') {
-                wsReady = true;
-                _setWsStatus('online');
-                if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+    fetch('api/ws_token.php', { credentials: 'same-origin' })
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((d) => {
+            if (!d.success || !d.token) return Promise.reject(new Error('ws_token'));
+            return d.token;
+        })
+        .then((token) => {
+            let socket;
+            try {
+                ws = new WebSocket(WS_HOST);
+                socket = ws;
+            } catch (e) {
+                console.warn('WebSocket không khả dụng, dùng fallback polling.');
+                _startFallbackPolling();
+                return;
             }
 
-            if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-                if (data.user_name === currentUserName) return;
+            socket.onopen = () => {
+                if (ws !== socket) return;
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = null;
+                _stopFallbackPolling();
+                socket.send(JSON.stringify({ type: 'auth', token }));
+                _setWsStatus('connecting');
+            };
 
-                const c = String(data.content ?? '');
-                const inboundKey = [
-                    data.note_id,
-                    data.user_name,
-                    data.timestamp ?? '',
-                    data.title ?? '',
-                    c.length,
-                    c.slice(0, 256)
-                ].join('\x1e');
-                if (inboundKey === _lastWsInboundKey) return;
-                _lastWsInboundKey = inboundKey;
-
-                const titleEl   = document.getElementById('noteTitle');
-                const contentEl = document.getElementById('noteContent');
-
-                const isEditingTitle   = document.activeElement === titleEl;
-                const isEditingContent = document.activeElement === contentEl;
-
-                window.__remoteUpdating = true;
+            socket.onmessage = (event) => {
+                if (ws !== socket) return;
                 try {
-                    // FIX: cập nhật version ngay khi nhận WS update
-                    // (cả từ typing broadcast lẫn from_save)
-                    if (data.version) {
-                        contentEl.dataset.version = data.version;
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === 'auth_error') {
+                        wsReady = false;
+                        _setWsStatus('offline');
+                        try { socket.close(); } catch (e2) {}
+                        return;
                     }
 
-                    if (data.title !== undefined && !isEditingTitle) {
-                        titleEl.value = data.title;
+                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+                        console.warn('[WS] join_denied:', data.message || '');
+                        return;
                     }
 
-                    if (data.content !== undefined) {
-                        const currentContent  = contentEl.value    || '';
-                        const incomingContent = String(data.content);
+                    if (data.type === 'auth_success') {
+                        wsReady = true;
+                        _setWsStatus('online');
+                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+                    }
 
-                        if (!isEditingContent) {
-                            contentEl.value = incomingContent;
-                        } else {
-                            const isDeleting   = incomingContent.length < currentContent.length;
-                            const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+                        if (data.user_name === currentUserName) return;
 
-                            if (isDeleting || tooDifferent) {
-                                const cursorPos = contentEl.selectionStart;
-                                contentEl.value = incomingContent;
-                                try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e) {}
-                            }
+                        const contentElPre = document.getElementById('noteContent');
+                        const incomingVer = data.version != null && data.version !== ''
+                            ? parseInt(data.version, 10)
+                            : NaN;
+                        const rawLocal = contentElPre && contentElPre.dataset.version;
+                        const localVer = rawLocal !== undefined && rawLocal !== ''
+                            ? parseInt(rawLocal, 10)
+                            : NaN;
+                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                            return;
                         }
+
+                        const c = String(data.content ?? '');
+                        const inboundKey = [
+                            data.note_id,
+                            data.user_name,
+                            data.timestamp ?? '',
+                            data.title ?? '',
+                            c.length,
+                            c.slice(0, 256)
+                        ].join('\x1e');
+                        if (inboundKey === _lastWsInboundKey) return;
+                        _lastWsInboundKey = inboundKey;
+
+                        const titleEl   = document.getElementById('noteTitle');
+                        const contentEl = document.getElementById('noteContent');
+
+                        const isEditingTitle   = document.activeElement === titleEl;
+                        const isEditingContent = document.activeElement === contentEl;
+
+                        window.__remoteUpdating = true;
+                        try {
+                            if (data.version != null && data.version !== '') {
+                                contentEl.dataset.version = String(data.version);
+                            }
+
+                            if (data.title !== undefined && !isEditingTitle) {
+                                titleEl.value = data.title;
+                            }
+
+                            if (data.content !== undefined) {
+                                const currentContent  = contentEl.value    || '';
+                                const incomingContent = String(data.content);
+
+                                if (!isEditingContent) {
+                                    contentEl.value = incomingContent;
+                                } else {
+                                    const isDeleting   = incomingContent.length < currentContent.length;
+                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                                    if (isDeleting || tooDifferent) {
+                                        const cursorPos = contentEl.selectionStart;
+                                        contentEl.value = incomingContent;
+                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                                    }
+                                }
+                            }
+                        } finally {
+                            window.__remoteUpdating = false;
+                        }
+
+                        _showTypingIndicator(data.user_name);
                     }
-                } finally {
-                    window.__remoteUpdating = false;
+
+                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+                        _renderPresence(data.users);
+                    }
+                } catch (e) {
+                    console.error('WS parse error:', e);
                 }
+            };
 
-                _showTypingIndicator(data.user_name);
-            }
+            socket.onclose = () => {
+                if (ws !== socket) return;
+                wsReady = false;
+                _setWsStatus('offline');
+                ws = null;
+                clearTimeout(wsReconnectTimer);
+                wsReconnectTimer = setTimeout(() => {
+                    wsReconnectTimer = null;
+                    connectWebSocket();
+                }, 3000);
+            };
 
-            if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-                _renderPresence(data.users);
-            }
-        } catch (e) {
-            console.error('WS parse error:', e);
-        }
-    };
-
-    socket.onclose = () => {
-        if (ws !== socket) return;
-        wsReady = false;
-        _setWsStatus('offline');
-        ws = null;
-        clearTimeout(wsReconnectTimer);
-        wsReconnectTimer = setTimeout(() => {
-            wsReconnectTimer = null;
-            connectWebSocket();
-        }, 3000);
-    };
-
-    socket.onerror = () => {
-        if (ws !== socket) return;
-        _setWsStatus('offline');
-    };
+            socket.onerror = () => {
+                if (ws !== socket) return;
+                _setWsStatus('offline');
+            };
+        })
+        .catch(() => {
+            console.warn('WebSocket không lấy được token, dùng fallback polling.');
+            _startFallbackPolling();
+        });
 }
 
 function _wsSend(obj) {
@@ -4181,6 +4882,7 @@ function uploadImage() {
     const fd = new FormData();
     fd.append('image',   f);
     fd.append('note_id', nid);
+    appendCsrfToken(fd);
 
     fetch('api/upload_image.php', { method: 'POST', body: fd })
         .then(r => r.json())
@@ -4250,7 +4952,7 @@ function addNewLabel() {
     fetch('api/manage_labels.php?action=add', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `name=${encodeURIComponent(name)}`
+        body:    appendCsrfUrlEncoded(`name=${encodeURIComponent(name)}`)
     }).then(() => { document.getElementById('newLabelName').value = ''; loadFilterLabels(); });
 }
 
@@ -4260,7 +4962,7 @@ function renameLabel(id, currentName) {
     fetch('api/manage_labels.php?action=rename', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `id=${id}&name=${encodeURIComponent(newName.trim())}`
+        body:    appendCsrfUrlEncoded(`id=${id}&name=${encodeURIComponent(newName.trim())}`)
     }).then(() => loadFilterLabels(() => liveSearch()));
 }
 
@@ -4269,7 +4971,7 @@ function deleteLabel(id) {
         fetch('api/manage_labels.php?action=delete', {
             method:  'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body:    `id=${id}`
+            body:    appendCsrfUrlEncoded(`id=${id}`)
         }).then(() => {
             if (currentLabelId == id) currentLabelId = null;
             loadFilterLabels(() => liveSearch());
@@ -4306,7 +5008,7 @@ function addLabelToNote() {
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `note_id=${nid}&label_id=${lid}&action=add`
+        body:    appendCsrfUrlEncoded(`note_id=${nid}&label_id=${lid}&action=add`)
     }).then(() => {
         loadLabelsForNote(nid);
         liveSearch();
@@ -4318,7 +5020,7 @@ function removeLabel(nid, lid) {
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `note_id=${nid}&label_id=${lid}&action=remove`
+        body:    appendCsrfUrlEncoded(`note_id=${nid}&label_id=${lid}&action=remove`)
     }).then(() => { loadLabelsForNote(nid); liveSearch(); });
 }
 
@@ -4381,11 +5083,12 @@ function setView(v) {
 }
 
 function togglePin(id, state) {
-    fetch('api/pin_note.php', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    `id=${id}&is_pinned=${state}`
-    }).then(() => liveSearch());
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('is_pinned', state);
+    appendCsrfToken(fd);
+    fetch('api/pin_note.php', { method: 'POST', body: fd })
+        .then(() => liveSearch());
 }
 
 function changeColor(color) {
@@ -4513,6 +5216,10 @@ function initIndexedDB() {
     request.onsuccess = function (event) {
         db = event.target.result;
         console.log('[IndexedDB] Initialized v3');
+        scheduleOfflineSyncStateEvent();
+        if (navigator.onLine) {
+            setTimeout(syncOfflineNotes, 2000);
+        }
     };
 
     request.onerror = function (event) {
@@ -4528,13 +5235,100 @@ function saveNoteOffline(note) {
     if (!db) return;
     const noteToSave = {
         ...note,
-        isTemp:     isNoteTemp(note.id),
-        syncStatus: 'pending',
-        updated_at: new Date().toISOString()
+        isTemp:        isNoteTemp(note.id),
+        syncStatus:    'pending',
+        updated_at:    new Date().toISOString(),
+        retryCount:    0,
+        nextRetryAt:   undefined,
+        lastSyncError: undefined
     };
     const tx = db.transaction(['notes'], 'readwrite');
     tx.objectStore('notes').put(noteToSave);
     console.log(`[Offline] Saved note ${note.id}`);
+    scheduleOfflineSyncStateEvent();
+}
+
+function putOfflineNote(note) {
+    if (!db) return;
+    const tx = db.transaction(['notes'], 'readwrite');
+    tx.objectStore('notes').put(note);
+}
+
+async function bumpOfflineRetry(note, message) {
+    const retry = (note.retryCount || 0) + 1;
+    const exp   = Math.min(6, Math.max(0, retry - 1));
+    const delay = Math.min(OFFLINE_SYNC_MAX_DELAY_MS, OFFLINE_SYNC_BASE_DELAY_MS * Math.pow(2, exp));
+    putOfflineNote({
+        ...note,
+        syncStatus:    'error',
+        retryCount:    retry,
+        nextRetryAt:   Date.now() + delay,
+        lastSyncError: typeof message === 'string' ? message : 'Lỗi đồng bộ'
+    });
+    scheduleOfflineSyncRetrySweep();
+}
+
+let offlineSyncSweepTimer = null;
+
+function scheduleOfflineSyncRetrySweep() {
+    clearTimeout(offlineSyncSweepTimer);
+    offlineSyncSweepTimer = null;
+    if (!navigator.onLine || !db) return;
+    setTimeout(() => {
+        getAllOfflineNotes().then((notes) => {
+            const now = Date.now();
+            let minWait = null;
+            for (const n of notes) {
+                if (n.nextRetryAt && n.nextRetryAt > now) {
+                    const w = n.nextRetryAt - now + 300;
+                    if (minWait === null || w < minWait) minWait = w;
+                }
+            }
+            if (minWait == null) return;
+            offlineSyncSweepTimer = setTimeout(() => {
+                offlineSyncSweepTimer = null;
+                if (navigator.onLine) syncOfflineNotes();
+            }, minWait);
+        });
+    }, 0);
+}
+
+function scheduleOfflineSyncStateEvent() {
+    if (typeof queueMicrotask === 'function') {
+        queueMicrotask(() => { emitOfflineSyncStateEvent(); });
+    } else {
+        setTimeout(() => { emitOfflineSyncStateEvent(); }, 0);
+    }
+}
+
+async function getOfflineSyncSummary() {
+    const notes = await getAllOfflineNotes();
+    const now   = Date.now();
+    let errorCount = 0;
+    let backoffCount = 0;
+    for (const n of notes) {
+        if (n.syncStatus === 'error') errorCount++;
+        if (n.nextRetryAt && n.nextRetryAt > now) backoffCount++;
+    }
+    return {
+        total:          notes.length,
+        errorCount,
+        backoffCount,
+        readyCount:     Math.max(0, notes.length - backoffCount),
+        syncing:        offlineSyncIsRunning
+    };
+}
+
+function emitOfflineSyncStateEvent() {
+    getOfflineSyncSummary().then((detail) => {
+        try {
+            window.dispatchEvent(new CustomEvent('noteapp:offline-sync', { detail }));
+        } catch (e) { /* ignore */ }
+    });
+}
+
+if (typeof window !== 'undefined') {
+    window.getNoteAppOfflineSyncSummary = getOfflineSyncSummary;
 }
 
 async function getAllOfflineNotes() {
@@ -4553,35 +5347,112 @@ async function syncOfflineNotes() {
 
     const offlineNotes = await getAllOfflineNotes();
     if (offlineNotes.length === 0) return;
-    console.log(`[Offline Sync] Found ${offlineNotes.length} notes`);
 
-    let syncedCount = 0;
-    for (const note of offlineNotes) {
-        try {
-            const fd = new FormData();
-            fd.append('id',         isNoteTemp(note.id) ? 0 : note.id);
-            fd.append('title',      note.title   || '');
-            fd.append('content',    note.content || '');
-            fd.append('version',    note.version || 1);
-            appendCsrfToken(fd);
+    const now        = Date.now();
+    const toProcess  = offlineNotes.filter((n) => !n.nextRetryAt || n.nextRetryAt <= now);
+    if (toProcess.length === 0) {
+        scheduleOfflineSyncStateEvent();
+        scheduleOfflineSyncRetrySweep();
+        return;
+    }
 
-            const res  = await fetch('api/save_note.php', { method: 'POST', body: fd });
-            const data = await res.json();
+    console.log(`[Offline Sync] Found ${offlineNotes.length} notes (${toProcess.length} due now)`);
+    offlineSyncIsRunning = true;
+    emitOfflineSyncStateEvent();
 
-            if (data.success) {
-                syncedCount++;
-                const delTx = db.transaction(['notes'], 'readwrite');
-                delTx.objectStore('notes').delete(note.id);
-                console.log(`[Offline] Synced ${note.id} → ${data.note_id}`);
+    let syncedCount              = 0;
+    let conflictStillPending    = 0;
+
+    for (const note of toProcess) {
+        let work               = { ...note };
+        let unresolvedConflict = false;
+
+        for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+                const fd = new FormData();
+                fd.append('id',         isNoteTemp(work.id) ? 0 : work.id);
+                fd.append('title',      work.title   || '');
+                fd.append('content',    work.content || '');
+                fd.append('version',    String(work.version != null && work.version !== '' ? work.version : 1));
+                appendCsrfToken(fd);
+
+                const res = await fetch('api/save_note.php', { method: 'POST', body: fd });
+
+                let data;
+                try {
+                    data = await res.json();
+                } catch (parseErr) {
+                    console.error('Sync failed for note', work.id, parseErr);
+                    unresolvedConflict = false;
+                    await bumpOfflineRetry(work, 'Phản hồi máy chủ không hợp lệ');
+                    break;
+                }
+
+                if (!res.ok) {
+                    unresolvedConflict = false;
+                    await bumpOfflineRetry(work, `Lỗi HTTP ${res.status}`);
+                    break;
+                }
+
+                if (data.success) {
+                    unresolvedConflict = false;
+                    syncedCount++;
+                    const delTx = db.transaction(['notes'], 'readwrite');
+                    delTx.objectStore('notes').delete(work.id);
+                    console.log(`[Offline] Synced ${work.id} → ${data.note_id}`);
+                    break;
+                }
+
+                if (data.conflict) {
+                    unresolvedConflict = true;
+                    const serverVer = parseInt(data.version, 10);
+                    work = {
+                        ...work,
+                        title:         work.title,
+                        content:       work.content,
+                        version:       Number.isFinite(serverVer) ? serverVer : (work.version || 1),
+                        syncStatus:    'pending',
+                        retryCount:    0,
+                        nextRetryAt:   undefined,
+                        lastSyncError: undefined,
+                        updated_at:    work.updated_at
+                    };
+                    putOfflineNote(work);
+                    continue;
+                }
+
+                unresolvedConflict = false;
+                await bumpOfflineRetry(work, data.message || 'Đồng bộ thất bại');
+                break;
+            } catch (err) {
+                console.error('Sync failed for note', work.id, err);
+                unresolvedConflict = false;
+                await bumpOfflineRetry(work, (err && err.message) || 'Lỗi mạng');
+                break;
             }
-        } catch (err) {
-            console.error('Sync failed for note', note.id, err);
+        }
+
+        if (unresolvedConflict) {
+            conflictStillPending++;
+            await bumpOfflineRetry(work, 'Xung đột phiên bản lặp lại; giữ bản cục bộ và chờ thử lại');
         }
     }
+
+    offlineSyncIsRunning = false;
+    emitOfflineSyncStateEvent();
+    scheduleOfflineSyncRetrySweep();
 
     if (syncedCount > 0) {
         showToast(`Đã đồng bộ ${syncedCount} ghi chú từ chế độ offline`, 'success');
         setTimeout(liveSearch, 800);
+    }
+    if (conflictStillPending > 0) {
+        showToast(
+            conflictStillPending === 1
+                ? 'Một ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.'
+                : `${conflictStillPending} ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.`,
+            'warning'
+        );
     }
 }
 
@@ -4599,6 +5470,1583 @@ async function loadNotesOfflineFallback() {
 }
 //----//
 
+Thư mục websocket
+server.php
+//code//
+<?php
+// websocket/server.php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+require_once __DIR__ . '/../database.php';
+
+use Ratchet\Http\HttpServer;
+use Ratchet\Server\IoServer;
+use Ratchet\WebSocket\WsServer;
+
+use App\NoteWebSocket;
+
+$wsCfg    = require __DIR__ . '/ws_secret.php';
+$wsSecret = $wsCfg['secret'] ?? '';
+
+if ($wsSecret === '') {
+    fwrite(STDERR, "ERROR: websocket/ws_secret.php must define a non-empty secret.\n");
+    exit(1);
+}
+
+// =====================================================
+// WEBSOCKET SERVER
+// =====================================================
+
+$server = IoServer::factory(
+    new HttpServer(
+        new WsServer(
+            new NoteWebSocket($pdo, $wsSecret)
+        )
+    ),
+    8080
+);
+
+echo "🚀 WebSocket running at ws://localhost:8080\n";
+
+$server->run();
+//----//
+
+ws_secret.php
+//code//
+<?php
+/**
+ * Shared secret for WebSocket HMAC tokens (must match NoteWebSocket + api/ws_token.php).
+ * Override in production: set env NOTEAPP_WS_SECRET to a long random string.
+ */
+return [
+    'secret' => getenv('NOTEAPP_WS_SECRET') ?: 'noteapp-ws-local-dev-secret-min-length-32-chars!',
+];
+
+//----//
+
+activate.php
+//code//
+<?php
+session_start();
+require_once 'database.php';
+
+$message = '';
+$token = $_GET['token'] ?? '';
+
+if (!empty($token)) {
+    $stmt = $pdo->prepare("
+        SELECT id, display_name 
+        FROM users 
+        WHERE activation_token = ? 
+          AND activation_expiry > NOW() 
+          AND is_activated = 0 
+        LIMIT 1
+    ");
+    $stmt->execute([$token]);
+    $user = $stmt->fetch();
+
+    if ($user) {
+        $update = $pdo->prepare("
+            UPDATE users 
+            SET is_activated = 1, 
+                activation_token = NULL, 
+                activation_expiry = NULL,
+                email_verified_at = NOW()
+            WHERE id = ?
+        ");
+        $update->execute([$user['id']]);
+
+        $_SESSION['user_id']      = $user['id'];
+        $_SESSION['display_name'] = $user['display_name'];
+        $_SESSION['is_activated'] = 1;
+
+        session_regenerate_id(true);
+
+        $message = "Kích hoạt tài khoản thành công!";
+        header("Location: index.php?activated=1");
+        exit;
+    } else {
+        $message = "Link kích hoạt không hợp lệ hoặc đã hết hạn!";
+    }
+} else {
+    $message = "Token không hợp lệ!";
+}
+?>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <title>Kích hoạt tài khoản</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container mt-5">
+    <div class="row justify-content-center">
+        <div class="col-md-5">
+            <div class="card shadow">
+                <div class="card-body text-center">
+                    <h3>Kích hoạt tài khoản</h3>
+                    <div class="alert alert-info"><?= htmlspecialchars($message) ?></div>
+                    <a href="login.php" class="btn btn-primary">Đăng nhập</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+//----//
+
+composer.json
+//code//
+{
+    "name": "noteapp/pro",
+    "require": {
+        "cboden/ratchet": "^0.4.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "App/"
+        }
+    }
+}
+//----//
+
+composer.lock
+//code//
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "5d52e477307bf204bf133801c3d7ba55",
+    "packages": [
+        {
+            "name": "cboden/ratchet",
+            "version": "v0.4.4",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/ratchetphp/Ratchet.git",
+                "reference": "5012dc954541b40c5599d286fd40653f5716a38f"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/ratchetphp/Ratchet/zipball/5012dc954541b40c5599d286fd40653f5716a38f",
+                "reference": "5012dc954541b40c5599d286fd40653f5716a38f",
+                "shasum": ""
+            },
+            "require": {
+                "guzzlehttp/psr7": "^1.7|^2.0",
+                "php": ">=5.4.2",
+                "ratchet/rfc6455": "^0.3.1",
+                "react/event-loop": ">=0.4",
+                "react/socket": "^1.0 || ^0.8 || ^0.7 || ^0.6 || ^0.5",
+                "symfony/http-foundation": "^2.6|^3.0|^4.0|^5.0|^6.0",
+                "symfony/routing": "^2.6|^3.0|^4.0|^5.0|^6.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "~4.8"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Ratchet\\": "src/Ratchet"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Matt Bonneau",
+                    "role": "Developer"
+                }
+            ],
+            "description": "PHP WebSocket library",
+            "homepage": "http://socketo.me",
+            "keywords": [
+                "Ratchet",
+                "WebSockets",
+                "server",
+                "sockets",
+                "websocket"
+            ],
+            "support": {
+                "chat": "https://gitter.im/reactphp/reactphp",
+                "issues": "https://github.com/ratchetphp/Ratchet/issues",
+                "source": "https://github.com/ratchetphp/Ratchet/tree/v0.4.4"
+            },
+            "time": "2021-12-14T00:20:41+00:00"
+        },
+        {
+            "name": "evenement/evenement",
+            "version": "v3.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/igorw/evenement.git",
+                "reference": "0a16b0d71ab13284339abb99d9d2bd813640efbc"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/igorw/evenement/zipball/0a16b0d71ab13284339abb99d9d2bd813640efbc",
+                "reference": "0a16b0d71ab13284339abb99d9d2bd813640efbc",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9 || ^6"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Evenement\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Igor Wiedler",
+                    "email": "igor@wiedler.ch"
+                }
+            ],
+            "description": "Événement is a very simple event dispatching library for PHP",
+            "keywords": [
+                "event-dispatcher",
+                "event-emitter"
+            ],
+            "support": {
+                "issues": "https://github.com/igorw/evenement/issues",
+                "source": "https://github.com/igorw/evenement/tree/v3.0.2"
+            },
+            "time": "2023-08-08T05:53:35+00:00"
+        },
+        {
+            "name": "guzzlehttp/psr7",
+            "version": "2.9.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/guzzle/psr7.git",
+                "reference": "7d0ed42f28e42d61352a7a79de682e5e67fec884"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/guzzle/psr7/zipball/7d0ed42f28e42d61352a7a79de682e5e67fec884",
+                "reference": "7d0ed42f28e42d61352a7a79de682e5e67fec884",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.2.5 || ^8.0",
+                "psr/http-factory": "^1.0",
+                "psr/http-message": "^1.1 || ^2.0",
+                "ralouphie/getallheaders": "^3.0"
+            },
+            "provide": {
+                "psr/http-factory-implementation": "1.0",
+                "psr/http-message-implementation": "1.0"
+            },
+            "require-dev": {
+                "bamarni/composer-bin-plugin": "^1.8.2",
+                "http-interop/http-factory-tests": "0.9.0",
+                "jshttp/mime-db": "1.54.0.1",
+                "phpunit/phpunit": "^8.5.44 || ^9.6.25"
+            },
+            "suggest": {
+                "laminas/laminas-httphandlerrunner": "Emit PSR-7 responses"
+            },
+            "type": "library",
+            "extra": {
+                "bamarni-bin": {
+                    "bin-links": true,
+                    "forward-command": false
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "GuzzleHttp\\Psr7\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Graham Campbell",
+                    "email": "hello@gjcampbell.co.uk",
+                    "homepage": "https://github.com/GrahamCampbell"
+                },
+                {
+                    "name": "Michael Dowling",
+                    "email": "mtdowling@gmail.com",
+                    "homepage": "https://github.com/mtdowling"
+                },
+                {
+                    "name": "George Mponos",
+                    "email": "gmponos@gmail.com",
+                    "homepage": "https://github.com/gmponos"
+                },
+                {
+                    "name": "Tobias Nyholm",
+                    "email": "tobias.nyholm@gmail.com",
+                    "homepage": "https://github.com/Nyholm"
+                },
+                {
+                    "name": "Márk Sági-Kazár",
+                    "email": "mark.sagikazar@gmail.com",
+                    "homepage": "https://github.com/sagikazarmark"
+                },
+                {
+                    "name": "Tobias Schultze",
+                    "email": "webmaster@tubo-world.de",
+                    "homepage": "https://github.com/Tobion"
+                },
+                {
+                    "name": "Márk Sági-Kazár",
+                    "email": "mark.sagikazar@gmail.com",
+                    "homepage": "https://sagikazarmark.hu"
+                }
+            ],
+            "description": "PSR-7 message implementation that also provides common utility methods",
+            "keywords": [
+                "http",
+                "message",
+                "psr-7",
+                "request",
+                "response",
+                "stream",
+                "uri",
+                "url"
+            ],
+            "support": {
+                "issues": "https://github.com/guzzle/psr7/issues",
+                "source": "https://github.com/guzzle/psr7/tree/2.9.0"
+            },
+            "funding": [
+                {
+                    "url": "https://github.com/GrahamCampbell",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/Nyholm",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/guzzlehttp/psr7",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-03-10T16:41:02+00:00"
+        },
+        {
+            "name": "phpmailer/phpmailer",
+            "version": "v7.0.2",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/PHPMailer/PHPMailer.git",
+                "reference": "ebf1655bd5b99b3f97e1a3ec0a69e5f4cd7ea088"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/PHPMailer/PHPMailer/zipball/ebf1655bd5b99b3f97e1a3ec0a69e5f4cd7ea088",
+                "reference": "ebf1655bd5b99b3f97e1a3ec0a69e5f4cd7ea088",
+                "shasum": ""
+            },
+            "require": {
+                "ext-ctype": "*",
+                "ext-filter": "*",
+                "ext-hash": "*",
+                "php": ">=5.5.0"
+            },
+            "require-dev": {
+                "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+                "doctrine/annotations": "^1.2.6 || ^1.13.3",
+                "php-parallel-lint/php-console-highlighter": "^1.0.0",
+                "php-parallel-lint/php-parallel-lint": "^1.3.2",
+                "phpcompatibility/php-compatibility": "^10.0.0@dev",
+                "squizlabs/php_codesniffer": "^3.13.5",
+                "yoast/phpunit-polyfills": "^1.0.4"
+            },
+            "suggest": {
+                "decomplexity/SendOauth2": "Adapter for using XOAUTH2 authentication",
+                "directorytree/imapengine": "For uploading sent messages via IMAP, see gmail example",
+                "ext-imap": "Needed to support advanced email address parsing according to RFC822",
+                "ext-mbstring": "Needed to send email in multibyte encoding charset or decode encoded addresses",
+                "ext-openssl": "Needed for secure SMTP sending and DKIM signing",
+                "greew/oauth2-azure-provider": "Needed for Microsoft Azure XOAUTH2 authentication",
+                "hayageek/oauth2-yahoo": "Needed for Yahoo XOAUTH2 authentication",
+                "league/oauth2-google": "Needed for Google XOAUTH2 authentication",
+                "psr/log": "For optional PSR-3 debug logging",
+                "symfony/polyfill-mbstring": "To support UTF-8 if the Mbstring PHP extension is not enabled (^1.2)",
+                "thenetworg/oauth2-azure": "Needed for Microsoft XOAUTH2 authentication"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "PHPMailer\\PHPMailer\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "LGPL-2.1-only"
+            ],
+            "authors": [
+                {
+                    "name": "Marcus Bointon",
+                    "email": "phpmailer@synchromedia.co.uk"
+                },
+                {
+                    "name": "Jim Jagielski",
+                    "email": "jimjag@gmail.com"
+                },
+                {
+                    "name": "Andy Prevost",
+                    "email": "codeworxtech@users.sourceforge.net"
+                },
+                {
+                    "name": "Brent R. Matzelle"
+                }
+            ],
+            "description": "PHPMailer is a full-featured email creation and transfer class for PHP",
+            "support": {
+                "issues": "https://github.com/PHPMailer/PHPMailer/issues",
+                "source": "https://github.com/PHPMailer/PHPMailer/tree/v7.0.2"
+            },
+            "funding": [
+                {
+                    "url": "https://github.com/Synchro",
+                    "type": "github"
+                }
+            ],
+            "time": "2026-01-09T18:02:33+00:00"
+        },
+        {
+            "name": "psr/http-factory",
+            "version": "1.1.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-factory.git",
+                "reference": "2b4765fddfe3b508ac62f829e852b1501d3f6e8a"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-factory/zipball/2b4765fddfe3b508ac62f829e852b1501d3f6e8a",
+                "reference": "2b4765fddfe3b508ac62f829e852b1501d3f6e8a",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.1",
+                "psr/http-message": "^1.0 || ^2.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "1.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Message\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "PSR-17: Common interfaces for PSR-7 HTTP message factories",
+            "keywords": [
+                "factory",
+                "http",
+                "message",
+                "psr",
+                "psr-17",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "support": {
+                "source": "https://github.com/php-fig/http-factory"
+            },
+            "time": "2024-04-15T12:06:14+00:00"
+        },
+        {
+            "name": "psr/http-message",
+            "version": "2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/php-fig/http-message.git",
+                "reference": "402d35bcb92c70c026d1a6a9883f06b2ead23d71"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/php-fig/http-message/zipball/402d35bcb92c70c026d1a6a9883f06b2ead23d71",
+                "reference": "402d35bcb92c70c026d1a6a9883f06b2ead23d71",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^7.2 || ^8.0"
+            },
+            "type": "library",
+            "extra": {
+                "branch-alias": {
+                    "dev-master": "2.0.x-dev"
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Psr\\Http\\Message\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "PHP-FIG",
+                    "homepage": "https://www.php-fig.org/"
+                }
+            ],
+            "description": "Common interface for HTTP messages",
+            "homepage": "https://github.com/php-fig/http-message",
+            "keywords": [
+                "http",
+                "http-message",
+                "psr",
+                "psr-7",
+                "request",
+                "response"
+            ],
+            "support": {
+                "source": "https://github.com/php-fig/http-message/tree/2.0"
+            },
+            "time": "2023-04-04T09:54:51+00:00"
+        },
+        {
+            "name": "ralouphie/getallheaders",
+            "version": "3.0.3",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/ralouphie/getallheaders.git",
+                "reference": "120b605dfeb996808c31b6477290a714d356e822"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/ralouphie/getallheaders/zipball/120b605dfeb996808c31b6477290a714d356e822",
+                "reference": "120b605dfeb996808c31b6477290a714d356e822",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.6"
+            },
+            "require-dev": {
+                "php-coveralls/php-coveralls": "^2.1",
+                "phpunit/phpunit": "^5 || ^6.5"
+            },
+            "type": "library",
+            "autoload": {
+                "files": [
+                    "src/getallheaders.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Ralph Khattar",
+                    "email": "ralph.khattar@gmail.com"
+                }
+            ],
+            "description": "A polyfill for getallheaders.",
+            "support": {
+                "issues": "https://github.com/ralouphie/getallheaders/issues",
+                "source": "https://github.com/ralouphie/getallheaders/tree/develop"
+            },
+            "time": "2019-03-08T08:55:37+00:00"
+        },
+        {
+            "name": "ratchet/rfc6455",
+            "version": "v0.3.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/ratchetphp/RFC6455.git",
+                "reference": "7c964514e93456a52a99a20fcfa0de242a43ccdb"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/ratchetphp/RFC6455/zipball/7c964514e93456a52a99a20fcfa0de242a43ccdb",
+                "reference": "7c964514e93456a52a99a20fcfa0de242a43ccdb",
+                "shasum": ""
+            },
+            "require": {
+                "guzzlehttp/psr7": "^2 || ^1.7",
+                "php": ">=5.4.2"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^5.7",
+                "react/socket": "^1.3"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Ratchet\\RFC6455\\": "src"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "role": "Developer"
+                },
+                {
+                    "name": "Matt Bonneau",
+                    "role": "Developer"
+                }
+            ],
+            "description": "RFC6455 WebSocket protocol handler",
+            "homepage": "http://socketo.me",
+            "keywords": [
+                "WebSockets",
+                "rfc6455",
+                "websocket"
+            ],
+            "support": {
+                "chat": "https://gitter.im/reactphp/reactphp",
+                "issues": "https://github.com/ratchetphp/RFC6455/issues",
+                "source": "https://github.com/ratchetphp/RFC6455/tree/v0.3.1"
+            },
+            "time": "2021-12-09T23:20:49+00:00"
+        },
+        {
+            "name": "react/cache",
+            "version": "v1.2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/cache.git",
+                "reference": "d47c472b64aa5608225f47965a484b75c7817d5b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/cache/zipball/d47c472b64aa5608225f47965a484b75c7817d5b",
+                "reference": "d47c472b64aa5608225f47965a484b75c7817d5b",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.0",
+                "react/promise": "^3.0 || ^2.0 || ^1.1"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.5 || ^5.7 || ^4.8.35"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "React\\Cache\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "Async, Promise-based cache interface for ReactPHP",
+            "keywords": [
+                "cache",
+                "caching",
+                "promise",
+                "reactphp"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/cache/issues",
+                "source": "https://github.com/reactphp/cache/tree/v1.2.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2022-11-30T15:59:55+00:00"
+        },
+        {
+            "name": "react/dns",
+            "version": "v1.14.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/dns.git",
+                "reference": "7562c05391f42701c1fccf189c8225fece1cd7c3"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/dns/zipball/7562c05391f42701c1fccf189c8225fece1cd7c3",
+                "reference": "7562c05391f42701c1fccf189c8225fece1cd7c3",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.0",
+                "react/cache": "^1.0 || ^0.6 || ^0.5",
+                "react/event-loop": "^1.2",
+                "react/promise": "^3.2 || ^2.7 || ^1.2.1"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.6 || ^5.7 || ^4.8.36",
+                "react/async": "^4.3 || ^3 || ^2",
+                "react/promise-timer": "^1.11"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "React\\Dns\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "Async DNS resolver for ReactPHP",
+            "keywords": [
+                "async",
+                "dns",
+                "dns-resolver",
+                "reactphp"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/dns/issues",
+                "source": "https://github.com/reactphp/dns/tree/v1.14.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2025-11-18T19:34:28+00:00"
+        },
+        {
+            "name": "react/event-loop",
+            "version": "v1.6.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/event-loop.git",
+                "reference": "ba276bda6083df7e0050fd9b33f66ad7a4ac747a"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/event-loop/zipball/ba276bda6083df7e0050fd9b33f66ad7a4ac747a",
+                "reference": "ba276bda6083df7e0050fd9b33f66ad7a4ac747a",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=5.3.0"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.6 || ^5.7 || ^4.8.36"
+            },
+            "suggest": {
+                "ext-pcntl": "For signal handling support when using the StreamSelectLoop"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "React\\EventLoop\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "ReactPHP's core reactor event loop that libraries can use for evented I/O.",
+            "keywords": [
+                "asynchronous",
+                "event-loop"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/event-loop/issues",
+                "source": "https://github.com/reactphp/event-loop/tree/v1.6.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2025-11-17T20:46:25+00:00"
+        },
+        {
+            "name": "react/promise",
+            "version": "v3.3.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/promise.git",
+                "reference": "23444f53a813a3296c1368bb104793ce8d88f04a"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/promise/zipball/23444f53a813a3296c1368bb104793ce8d88f04a",
+                "reference": "23444f53a813a3296c1368bb104793ce8d88f04a",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.1.0"
+            },
+            "require-dev": {
+                "phpstan/phpstan": "1.12.28 || 1.4.10",
+                "phpunit/phpunit": "^9.6 || ^7.5"
+            },
+            "type": "library",
+            "autoload": {
+                "files": [
+                    "src/functions_include.php"
+                ],
+                "psr-4": {
+                    "React\\Promise\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "A lightweight implementation of CommonJS Promises/A for PHP",
+            "keywords": [
+                "promise",
+                "promises"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/promise/issues",
+                "source": "https://github.com/reactphp/promise/tree/v3.3.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2025-08-19T18:57:03+00:00"
+        },
+        {
+            "name": "react/socket",
+            "version": "v1.17.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/socket.git",
+                "reference": "ef5b17b81f6f60504c539313f94f2d826c5faa08"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/socket/zipball/ef5b17b81f6f60504c539313f94f2d826c5faa08",
+                "reference": "ef5b17b81f6f60504c539313f94f2d826c5faa08",
+                "shasum": ""
+            },
+            "require": {
+                "evenement/evenement": "^3.0 || ^2.0 || ^1.0",
+                "php": ">=5.3.0",
+                "react/dns": "^1.13",
+                "react/event-loop": "^1.2",
+                "react/promise": "^3.2 || ^2.6 || ^1.2.1",
+                "react/stream": "^1.4"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^9.6 || ^5.7 || ^4.8.36",
+                "react/async": "^4.3 || ^3.3 || ^2",
+                "react/promise-stream": "^1.4",
+                "react/promise-timer": "^1.11"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "React\\Socket\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "Async, streaming plaintext TCP/IP and secure TLS socket server and client connections for ReactPHP",
+            "keywords": [
+                "Connection",
+                "Socket",
+                "async",
+                "reactphp",
+                "stream"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/socket/issues",
+                "source": "https://github.com/reactphp/socket/tree/v1.17.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2025-11-19T20:47:34+00:00"
+        },
+        {
+            "name": "react/stream",
+            "version": "v1.4.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/reactphp/stream.git",
+                "reference": "1e5b0acb8fe55143b5b426817155190eb6f5b18d"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/reactphp/stream/zipball/1e5b0acb8fe55143b5b426817155190eb6f5b18d",
+                "reference": "1e5b0acb8fe55143b5b426817155190eb6f5b18d",
+                "shasum": ""
+            },
+            "require": {
+                "evenement/evenement": "^3.0 || ^2.0 || ^1.0",
+                "php": ">=5.3.8",
+                "react/event-loop": "^1.2"
+            },
+            "require-dev": {
+                "clue/stream-filter": "~1.2",
+                "phpunit/phpunit": "^9.6 || ^5.7 || ^4.8.36"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "React\\Stream\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Christian Lück",
+                    "email": "christian@clue.engineering",
+                    "homepage": "https://clue.engineering/"
+                },
+                {
+                    "name": "Cees-Jan Kiewiet",
+                    "email": "reactphp@ceesjankiewiet.nl",
+                    "homepage": "https://wyrihaximus.net/"
+                },
+                {
+                    "name": "Jan Sorgalla",
+                    "email": "jsorgalla@gmail.com",
+                    "homepage": "https://sorgalla.com/"
+                },
+                {
+                    "name": "Chris Boden",
+                    "email": "cboden@gmail.com",
+                    "homepage": "https://cboden.dev/"
+                }
+            ],
+            "description": "Event-driven readable and writable streams for non-blocking I/O in ReactPHP",
+            "keywords": [
+                "event-driven",
+                "io",
+                "non-blocking",
+                "pipe",
+                "reactphp",
+                "readable",
+                "stream",
+                "writable"
+            ],
+            "support": {
+                "issues": "https://github.com/reactphp/stream/issues",
+                "source": "https://github.com/reactphp/stream/tree/v1.4.0"
+            },
+            "funding": [
+                {
+                    "url": "https://opencollective.com/reactphp",
+                    "type": "open_collective"
+                }
+            ],
+            "time": "2024-06-11T12:45:25+00:00"
+        },
+        {
+            "name": "symfony/deprecation-contracts",
+            "version": "v3.7.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/deprecation-contracts.git",
+                "reference": "50f59d1f3ca46d41ac911f97a78626b6756af35b"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/deprecation-contracts/zipball/50f59d1f3ca46d41ac911f97a78626b6756af35b",
+                "reference": "50f59d1f3ca46d41ac911f97a78626b6756af35b",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=8.1"
+            },
+            "type": "library",
+            "extra": {
+                "thanks": {
+                    "url": "https://github.com/symfony/contracts",
+                    "name": "symfony/contracts"
+                },
+                "branch-alias": {
+                    "dev-main": "3.7-dev"
+                }
+            },
+            "autoload": {
+                "files": [
+                    "function.php"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "A generic function and convention to trigger deprecation notices",
+            "homepage": "https://symfony.com",
+            "support": {
+                "source": "https://github.com/symfony/deprecation-contracts/tree/v3.7.0"
+            },
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/nicolas-grekas",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-04-13T15:52:40+00:00"
+        },
+        {
+            "name": "symfony/http-foundation",
+            "version": "v6.4.35",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/http-foundation.git",
+                "reference": "cffffd0a2c037117b742b4f8b379a22a2a33f6d2"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/http-foundation/zipball/cffffd0a2c037117b742b4f8b379a22a2a33f6d2",
+                "reference": "cffffd0a2c037117b742b4f8b379a22a2a33f6d2",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=8.1",
+                "symfony/deprecation-contracts": "^2.5|^3",
+                "symfony/polyfill-mbstring": "~1.1",
+                "symfony/polyfill-php83": "^1.27"
+            },
+            "conflict": {
+                "symfony/cache": "<6.4.12|>=7.0,<7.1.5"
+            },
+            "require-dev": {
+                "doctrine/dbal": "^2.13.1|^3|^4",
+                "predis/predis": "^1.1|^2.0",
+                "symfony/cache": "^6.4.12|^7.1.5",
+                "symfony/dependency-injection": "^5.4|^6.0|^7.0",
+                "symfony/expression-language": "^5.4|^6.0|^7.0",
+                "symfony/http-kernel": "^5.4.12|^6.0.12|^6.1.4|^7.0",
+                "symfony/mime": "^5.4|^6.0|^7.0",
+                "symfony/rate-limiter": "^5.4|^6.0|^7.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\HttpFoundation\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Defines an object-oriented layer for the HTTP specification",
+            "homepage": "https://symfony.com",
+            "support": {
+                "source": "https://github.com/symfony/http-foundation/tree/v6.4.35"
+            },
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/nicolas-grekas",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-03-06T11:15:58+00:00"
+        },
+        {
+            "name": "symfony/polyfill-mbstring",
+            "version": "v1.37.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-mbstring.git",
+                "reference": "6a21eb99c6973357967f6ce3708cd55a6bec6315"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-mbstring/zipball/6a21eb99c6973357967f6ce3708cd55a6bec6315",
+                "reference": "6a21eb99c6973357967f6ce3708cd55a6bec6315",
+                "shasum": ""
+            },
+            "require": {
+                "ext-iconv": "*",
+                "php": ">=7.2"
+            },
+            "provide": {
+                "ext-mbstring": "*"
+            },
+            "suggest": {
+                "ext-mbstring": "For best performance"
+            },
+            "type": "library",
+            "extra": {
+                "thanks": {
+                    "url": "https://github.com/symfony/polyfill",
+                    "name": "symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "files": [
+                    "bootstrap.php"
+                ],
+                "psr-4": {
+                    "Symfony\\Polyfill\\Mbstring\\": ""
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill for the Mbstring extension",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "mbstring",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "support": {
+                "source": "https://github.com/symfony/polyfill-mbstring/tree/v1.37.0"
+            },
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/nicolas-grekas",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-04-10T17:25:58+00:00"
+        },
+        {
+            "name": "symfony/polyfill-php83",
+            "version": "v1.37.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/polyfill-php83.git",
+                "reference": "3600c2cb22399e25bb226e4a135ce91eeb2a6149"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/polyfill-php83/zipball/3600c2cb22399e25bb226e4a135ce91eeb2a6149",
+                "reference": "3600c2cb22399e25bb226e4a135ce91eeb2a6149",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=7.2"
+            },
+            "type": "library",
+            "extra": {
+                "thanks": {
+                    "url": "https://github.com/symfony/polyfill",
+                    "name": "symfony/polyfill"
+                }
+            },
+            "autoload": {
+                "files": [
+                    "bootstrap.php"
+                ],
+                "psr-4": {
+                    "Symfony\\Polyfill\\Php83\\": ""
+                },
+                "classmap": [
+                    "Resources/stubs"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Nicolas Grekas",
+                    "email": "p@tchwork.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Symfony polyfill backporting some PHP 8.3+ features to lower PHP versions",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "compatibility",
+                "polyfill",
+                "portable",
+                "shim"
+            ],
+            "support": {
+                "source": "https://github.com/symfony/polyfill-php83/tree/v1.37.0"
+            },
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/nicolas-grekas",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-04-10T17:25:58+00:00"
+        },
+        {
+            "name": "symfony/routing",
+            "version": "v6.4.37",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/symfony/routing.git",
+                "reference": "48035d186798d27d375d95aad37db8fe097e4048"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/symfony/routing/zipball/48035d186798d27d375d95aad37db8fe097e4048",
+                "reference": "48035d186798d27d375d95aad37db8fe097e4048",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=8.1",
+                "symfony/deprecation-contracts": "^2.5|^3"
+            },
+            "conflict": {
+                "doctrine/annotations": "<1.12",
+                "symfony/config": "<6.2",
+                "symfony/dependency-injection": "<5.4",
+                "symfony/yaml": "<5.4"
+            },
+            "require-dev": {
+                "doctrine/annotations": "^1.12|^2",
+                "psr/log": "^1|^2|^3",
+                "symfony/config": "^6.2|^7.0",
+                "symfony/dependency-injection": "^5.4|^6.0|^7.0",
+                "symfony/expression-language": "^5.4|^6.0|^7.0",
+                "symfony/http-foundation": "^5.4|^6.0|^7.0",
+                "symfony/yaml": "^5.4|^6.0|^7.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Symfony\\Component\\Routing\\": ""
+                },
+                "exclude-from-classmap": [
+                    "/Tests/"
+                ]
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Fabien Potencier",
+                    "email": "fabien@symfony.com"
+                },
+                {
+                    "name": "Symfony Community",
+                    "homepage": "https://symfony.com/contributors"
+                }
+            ],
+            "description": "Maps an HTTP request to a set of configuration variables",
+            "homepage": "https://symfony.com",
+            "keywords": [
+                "router",
+                "routing",
+                "uri",
+                "url"
+            ],
+            "support": {
+                "source": "https://github.com/symfony/routing/tree/v6.4.37"
+            },
+            "funding": [
+                {
+                    "url": "https://symfony.com/sponsor",
+                    "type": "custom"
+                },
+                {
+                    "url": "https://github.com/fabpot",
+                    "type": "github"
+                },
+                {
+                    "url": "https://github.com/nicolas-grekas",
+                    "type": "github"
+                },
+                {
+                    "url": "https://tidelift.com/funding/github/packagist/symfony/symfony",
+                    "type": "tidelift"
+                }
+            ],
+            "time": "2026-04-18T13:45:55+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {},
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}
+
+//----//
+
+config.php
+//code//
+<?php
+// Đảm bảo không sử dụng hardcoded ports hay hostnames trong source code 
+define('BASE_URL', '/'); // Vì project đặt trực tiếp trong htdocs theo yêu cầu [cite: 118, 119]
+
+// Cấu hình Mail (Dành cho Phase 2: Kích hoạt & Reset password) [cite: 21, 25]
+// Bạn sẽ cần thư viện PHPMailer hoặc tương tự ở Phase sau.
+define('MAIL_HOST', 'smtp.gmail.com');
+define('MAIL_USER', 'your-email@gmail.com');
+define('MAIL_PASS', 'your-app-password');
+?>
+//----//
+database.php
+//code//
+<?php
+// Cấu hình Database
+$host = 'localhost';
+$db   = 'note_management';
+$user = 'root'; // Thay đổi theo máy của bạn (thường là root trên XAMPP)
+$pass = '';     // Thay đổi theo máy của bạn (thường để trống trên XAMPP)
+$charset = 'utf8mb4';
+
+$dsn = "mysql:host=$host;dbname=$db;charset=utf8mb4";
+$options = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    PDO::ATTR_EMULATE_PREPARES   => false,
+];
+
+try {
+     $pdo = new PDO($dsn, $user, $pass, $options);
+} catch (\PDOException $e) {
+     // Lưu ý: Trong môi trường production không nên hiển thị lỗi chi tiết thế này
+     throw new \PDOException($e->getMessage(), (int)$e->getCode());
+}
+?>
+//----//
 database.sql
 //code//
 -- ============================================================
@@ -5461,8 +7909,6 @@ modals.php
         </div>
     </div>
 </div>
-
-
 //----//
 
 register.php
@@ -5638,8 +8084,9 @@ if (!empty($token)) {
 
 // Xử lý POST
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    // CSRF Protection
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token'] ?? '') {
+    $sessTok = $_SESSION['csrf_token'] ?? null;
+    $postTok = $_POST['csrf_token'] ?? null;
+    if (!is_string($sessTok) || $sessTok === '' || !is_string($postTok) || !hash_equals($sessTok, $postTok)) {
         $message = "<div class='alert alert-danger'>Yêu cầu không hợp lệ (CSRF)!</div>";
     } else {
         $action = $_POST['action'] ?? '';
@@ -5713,12 +8160,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute([$user_id]);
                 $user = $stmt->fetch();
 
-                $is_valid = $token_verified || 
-                    (
-                        $user && 
-                        $user['reset_token'] == $input && 
-                        $user['reset_token_expiry'] > date('Y-m-d H:i:s')
-                    );
+                $expiryOk = $user
+                    && !empty($user['reset_token_expiry'])
+                    && $user['reset_token_expiry'] > date('Y-m-d H:i:s');
+                $stored   = isset($user['reset_token']) ? (string) $user['reset_token'] : '';
+                $tokenOk  = $user && $stored !== '' && hash_equals($stored, (string) $input);
+
+                $is_valid = $token_verified || ($expiryOk && $tokenOk);
 
                 if ($is_valid) {
                     $hashed = password_hash($new_pass, PASSWORD_BCRYPT);
@@ -5848,20 +8296,22 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 </html>
 //----//
 
-service-worker.php
-//code//
-// ====================== SERVICE WORKER - NOTEAPP PRO ======================
-const CACHE_NAME = 'noteapp-v1.7';   // Tăng version khi update lớn
+service-worker.js
+// ====================== SERVICE WORKER - NOTEAPP PRO v1.8 ======================
+// Cải tiến: Background Sync + Offline Queue Support
+
+const CACHE_NAME = 'noteapp-v1.8';
+const OFFLINE_QUEUE = 'offline-queue';
 
 // ====================== INSTALL ======================
 self.addEventListener('install', event => {
-    console.log('[SW] Installing Service Worker v1.7...');
+    console.log('[SW] Installing Service Worker v1.8...');
     self.skipWaiting();
 });
 
 // ====================== ACTIVATE ======================
 self.addEventListener('activate', event => {
-    console.log('[SW] Activating...');
+    console.log('[SW] Activating Service Worker v1.8...');
 
     event.waitUntil(
         caches.keys().then(cacheNames => {
@@ -5893,23 +8343,19 @@ self.addEventListener('fetch', event => {
         return;
     }
 
-    // ==================== API & PHP - NETWORK FIRST ====================
+    // ==================== API & PHP - NETWORK FIRST (với fallback) ====================
     if (url.pathname.startsWith('/api/') || url.pathname.endsWith('.php')) {
-        
         event.respondWith(
             fetch(event.request)
                 .then(response => {
-                    // Clone response để cache nếu cần sau này
                     return response;
                 })
-                .catch(error => {
-                    console.warn('[SW] API Fetch Failed (Offline):', error);
-                    
-                    // Trả về response JSON offline để frontend biết
+                .catch(() => {
+                    console.warn('[SW] API Fetch Failed (Offline)');
                     return new Response(
                         JSON.stringify({
                             success: false,
-                            message: 'Bạn đang offline. Một số tính năng có thể không hoạt động.',
+                            message: 'Bạn đang offline. Thay đổi sẽ được đồng bộ khi có mạng.',
                             offline: true
                         }),
                         {
@@ -5947,7 +8393,7 @@ self.addEventListener('fetch', event => {
                             }
                             return networkResponse;
                         })
-                        .catch(() => cachedResponse); // Fallback to cache
+                        .catch(() => cachedResponse);
 
                     return cachedResponse || fetchPromise;
                 });
@@ -5964,18 +8410,79 @@ self.addEventListener('fetch', event => {
 self.addEventListener('sync', event => {
     if (event.tag === 'sync-notes') {
         console.log('[SW] Background Sync: sync-notes triggered');
-        // Có thể implement sync logic sau khi có API sync chuyên dụng
-        event.waitUntil(
-            // TODO: Sync offline notes khi có kết nối
-            Promise.resolve()
-        );
+        event.waitUntil(syncOfflineQueue());
     }
 });
+
+async function syncOfflineQueue() {
+    try {
+        const db = await openIDB();
+        const queue = await getAllFromStore(db, 'queue');
+
+        console.log(`[SW] Found ${queue.length} items in offline queue`);
+
+        for (const item of queue) {
+            try {
+                const response = await fetch(item.url, {
+                    method: item.method || 'POST',
+                    headers: item.headers || {},
+                    body: item.body
+                });
+
+                if (response.ok) {
+                    await deleteFromStore(db, 'queue', item.id);
+                    console.log(`[SW] Synced item ${item.id} successfully`);
+                } else {
+                    console.warn(`[SW] Sync failed for item ${item.id}:`, response.status);
+                }
+            } catch (err) {
+                console.error(`[SW] Sync error for item ${item.id}:`, err);
+            }
+        }
+    } catch (e) {
+        console.error('[SW] Background sync failed:', e);
+    }
+}
+
+// ====================== INDEXEDDB HELPERS ======================
+function openIDB() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open('NoteAppDB', 1);
+
+        request.onupgradeneeded = event => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains('queue')) {
+                const store = db.createObjectStore('queue', { autoIncrement: true });
+                store.createIndex('timestamp', 'timestamp');
+            }
+        };
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+
+async function getAllFromStore(db, storeName) {
+    return new Promise((resolve) => {
+        const tx = db.transaction(storeName, 'readonly');
+        const store = tx.objectStore(storeName);
+        const req = store.getAll();
+        req.onsuccess = () => resolve(req.result);
+    });
+}
+
+async function deleteFromStore(db, storeName, key) {
+    return new Promise((resolve) => {
+        const tx = db.transaction(storeName, 'readwrite');
+        tx.objectStore(storeName).delete(key);
+        tx.oncomplete = () => resolve();
+    });
+}
 
 // ====================== PUSH NOTIFICATION (tương lai) ======================
 self.addEventListener('push', event => {
     console.log('[SW] Push notification received');
 });
 
-console.log('[SW] NoteApp Service Worker v1.7 loaded successfully!');
+console.log('[SW] NoteApp Service Worker v1.8 loaded successfully!');
 //----//
