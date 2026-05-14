@@ -169,6 +169,15 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+    // Khôi phục màu nền mặc định từ session nếu có
+    const savedNoteColor = localStorage.getItem('noteapp_note_color') || document.documentElement.style.getPropertyValue('--note-default-color');
+    if (savedNoteColor) {
+        document.documentElement.style.setProperty('--note-default-color', savedNoteColor);
+    }
+    // Lưu lại khi người dùng thay đổi trong profile
+    document.getElementById('settingNoteColor')?.addEventListener('change', function() {
+        localStorage.setItem('noteapp_note_color', this.value);
+    });
 });
 
 // ====================== REALTIME TYPING BROADCAST (80ms debounce) ======================
@@ -1592,19 +1601,26 @@ function saveProfile() {
     const avatarFile = document.getElementById('inputAvatar').files[0];
     if (avatarFile) fd.append('avatar', avatarFile);
 
-    const fontSize  = document.getElementById('settingFontSize').value;
-    const theme     = document.getElementById('settingTheme').value;
+    const fontSize = document.getElementById('settingFontSize').value;
+    const theme = document.getElementById('settingTheme').value;
     const noteColor = document.getElementById('settingNoteColor').value;
 
-    fd.append('font_size',   fontSize);
+    fd.append('font_size', fontSize);
     fd.append('theme_color', theme);
-    fd.append('note_color',  noteColor);
+    fd.append('note_color', noteColor);
     appendCsrfToken(fd);
 
+    // Áp dụng ngay lập tức cho giao diện
     applyTheme(theme);
     document.documentElement.style.fontSize = fontSize;
-    document.body.style.fontSize            = fontSize;
+    document.body.style.fontSize = fontSize;
     document.documentElement.style.setProperty('--note-default-color', noteColor);
+    // Cập nhật màu cho tất cả các note card hiện tại (nếu không có màu riêng)
+    document.querySelectorAll('.note-card').forEach(card => {
+        if (!card.style.backgroundColor) {
+            card.style.backgroundColor = noteColor;
+        }
+    });
 
     fetch('api/update_profile.php', { method: 'POST', body: fd })
         .then(r => r.json())
@@ -1635,6 +1651,11 @@ function previewImage(input) {
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     localStorage.setItem('noteapp_theme', theme);
+    // Đảm bảo màu nền mặc định được giữ nguyên
+    const defaultColor = document.documentElement.style.getPropertyValue('--note-default-color');
+    if (defaultColor) {
+        document.documentElement.style.setProperty('--note-default-color', defaultColor);
+    }
 }
 
 // ====================== TIỆN ÍCH ======================
@@ -1654,27 +1675,57 @@ function togglePin(id, state) {
 
 function changeColor(color) {
     const id = document.getElementById('noteId').value;
-    if (!id) { showAlert('Vui lòng lưu ghi chú trước khi đổi màu!', 'warning'); return; }
+    if (!id) {
+        showAlert('Vui lòng lưu ghi chú trước khi đổi màu!', 'warning');
+        return;
+    }
 
     const fd = new FormData();
-    fd.append('id',         id);
-    fd.append('color',      color || '');
+    fd.append('id', id);
+    fd.append('color', color || '');
     appendCsrfToken(fd);
+
+    // Cập nhật UI ngay lập tức (optimistic)
+    const modalWrapper = document.getElementById('modalContentWrapper');
+    const resolvedColor = (color && color.trim() !== '') ? color : '';
+    if (modalWrapper) {
+        modalWrapper.style.backgroundColor = resolvedColor;
+        modalWrapper.style.setProperty('--note-individual-color', resolvedColor);
+    }
+    // Cập nhật card tương ứng trong danh sách nếu đang mở (sẽ được refresh sau)
+    // Hiển thị thông báo tạm thời
+    showToast('Đang cập nhật màu...', 'info');
+
+    if (!navigator.onLine) {
+        queueAction('api/change_color.php', fd);
+        showToast('Đã lưu thay đổi màu (offline)', 'success');
+        liveSearch();
+        return;
+    }
 
     fetch('api/change_color.php', { method: 'POST', body: fd })
         .then(res => res.json())
         .then(d => {
             if (d.success) {
-                const modalWrapper = document.getElementById('modalContentWrapper');
-                modalWrapper.style.backgroundColor = color || '';
-                modalWrapper.style.setProperty('--note-individual-color', color || '');
-                liveSearch();
-                showAlert('Đã đổi màu ghi chú thành công', 'success');
+                showToast('Đã đổi màu ghi chú thành công', 'success');
+                liveSearch(); // Refresh danh sách để cập nhật màu card
             } else {
-                showAlert('Không thể đổi màu ghi chú!', 'danger');
+                showAlert(d.message || 'Không thể đổi màu!', 'danger');
+                // Rollback UI nếu cần
+                if (modalWrapper) {
+                    modalWrapper.style.backgroundColor = '';
+                    modalWrapper.style.removeProperty('--note-individual-color');
+                }
             }
         })
-        .catch(() => showAlert('Lỗi kết nối!', 'danger'));
+        .catch(() => {
+            showAlert('Lỗi kết nối, vui lòng thử lại!', 'danger');
+            // Rollback
+            if (modalWrapper) {
+                modalWrapper.style.backgroundColor = '';
+                modalWrapper.style.removeProperty('--note-individual-color');
+            }
+        });
 }
 
 function formatRelativeTime(datetime) {

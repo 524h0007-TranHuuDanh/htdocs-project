@@ -1179,7 +1179,53 @@ body[data-bs-theme="dark"] .shared-banner,
         color: var(--text-on-glass-dark);
     }
 }
+/* =========================================================
+   DARK MODE - CUSTOM NOTE COLOR CONTRAST FIX
+   ========================================================= */
+body[data-bs-theme="dark"] .note-card[style*="background"],
+body[data-bs-theme="dark"] .note-card[style*="background-color"],
+[data-bs-theme="dark"] .note-card[style*="background"],
+[data-bs-theme="dark"] .note-card[style*="background-color"] {
+    /* Override mọi màu text mặc định của dark mode */
+    color: #0A1024 !important;
+}
 
+body[data-bs-theme="dark"] .note-card[style*="background"] .card-title,
+body[data-bs-theme="dark"] .note-card[style*="background"] .card-text,
+body[data-bs-theme="dark"] .note-card[style*="background"] p,
+body[data-bs-theme="dark"] .note-card[style*="background"] span,
+body[data-bs-theme="dark"] .note-card[style*="background"] small,
+[data-bs-theme="dark"] .note-card[style*="background"] .card-title,
+[data-bs-theme="dark"] .note-card[style*="background"] .card-text {
+    color: #0A1024 !important;
+}
+
+/* Cho modal khi có màu nền tùy chỉnh trong dark mode */
+body[data-bs-theme="dark"] .modal-content[style*="background"],
+body[data-bs-theme="dark"] .modal-content[style*="background-color"],
+[data-bs-theme="dark"] .modal-content[style*="background"],
+[data-bs-theme="dark"] .modal-content[style*="background-color"] {
+    color: #0A1024 !important;
+}
+
+body[data-bs-theme="dark"] .modal-content[style*="background"] .modal-title,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .modal-body,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+body[data-bs-theme="dark"] .modal-content[style*="background"] label,
+[data-bs-theme="dark"] .modal-content[style*="background"] .modal-title,
+[data-bs-theme="dark"] .modal-content[style*="background"] .modal-body {
+    color: #0A1024 !important;
+}
+
+/* Input trong modal màu nền tùy chỉnh */
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-select,
+[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+[data-bs-theme="dark"] .modal-content[style*="background"] .form-select {
+    background: rgba(255,255,255,0.85) !important;
+    color: #0A1024 !important;
+    border-color: rgba(0,0,0,0.2) !important;
+}
 /* =========================================================
    PERFORMANCE
    ========================================================= */
