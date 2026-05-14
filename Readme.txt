@@ -1609,546 +1609,333 @@ NoteWebSocket.php
 
 namespace App;
 
-
-
 use PDO;
-
 use Ratchet\MessageComponentInterface;
-
 use Ratchet\ConnectionInterface;
-
-
 
 class NoteWebSocket implements MessageComponentInterface {
 
     protected $clients;
-
     protected $noteSubscriptions = []; // note_id => [resourceId => ['conn' => conn, 'user_name' => str]]
-
     /** @var PDO */
-
     protected $pdo;
-
     protected $wsSecret;
 
-
-
     public function __construct(PDO $pdo, string $wsSecret) {
-
         $this->clients   = new \SplObjectStorage;
-
         $this->pdo       = $pdo;
-
         $this->wsSecret  = $wsSecret;
-
     }
-
-
 
     public function onOpen(ConnectionInterface $conn) {
-
         $this->clients->attach($conn);
-
         $conn->send(json_encode(['type' => 'ping']));
-
         $conn->user_id   = 0;
-
         $conn->user_name = 'Unknown';
-
         echo "[WS] New connection: {$conn->resourceId}\n";
-
     }
-
-
 
     public function onMessage(ConnectionInterface $from, $msg) {
-
         $data = json_decode($msg, true);
-
         if (!$data || !isset($data['type'])) return;
 
-
-
         switch ($data['type']) {
-
-
-
             case 'auth':
-
                 $this->handleAuth($from, $data);
-
                 break;
-
-
-
             case 'join_note':
-
                 $this->handleJoinNote($from, $data);
-
                 break;
-
-
-
             case 'leave_note':
-
                 $note_id = intval($data['note_id'] ?? 0);
-
                 $this->removeFromNote($from, $note_id);
-
                 break;
-
-
-
             case 'update':
-
                 $this->handleUpdate($from, $data);
-
                 break;
-
+            // ========== THÊM MỚI: xử lý màu sắc và hình ảnh ==========
+            case 'color_update':
+                $this->handleColorUpdate($from, $data);
+                break;
+            case 'image_added':
+                $this->handleImageAdded($from, $data);
+                break;
+            case 'image_deleted':
+                $this->handleImageDeleted($from, $data);
+                break;
         }
-
     }
 
-
-
     /**
-
-     * Verify HMAC token; bind identity from DB (ignore client-supplied user_id / user_name).
-
+     * Xác thực token và gán user_id, user_name cho connection.
      */
-
     private function handleAuth(ConnectionInterface $from, array $data) {
-
         $token = $data['token'] ?? '';
-
         if (!is_string($token) || $token === '') {
-
             $from->send(json_encode(['type' => 'auth_error', 'message' => 'Thiếu token']));
-
             return;
-
         }
-
-
 
         $uid = $this->verifyWsToken($token);
-
         if ($uid === null) {
-
             $from->send(json_encode(['type' => 'auth_error', 'message' => 'Token không hợp lệ hoặc đã hết hạn']));
-
             return;
-
         }
-
-
 
         $stmt = $this->pdo->prepare('SELECT id, display_name FROM users WHERE id = ? LIMIT 1');
-
         $stmt->execute([$uid]);
-
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-
-
         if (!$row) {
-
             $from->send(json_encode(['type' => 'auth_error', 'message' => 'Người dùng không tồn tại']));
-
             return;
-
         }
-
-
 
         $from->user_id   = (int) $row['id'];
-
         $from->user_name = $row['display_name'] !== '' && $row['display_name'] !== null
-
             ? $row['display_name']
-
             : 'User';
 
-
-
         $from->send(json_encode(['type' => 'auth_success']));
-
         echo "[WS] User {$from->user_id} ({$from->user_name}) authenticated via token\n";
-
     }
 
-
-
     /**
-
      * @return int|null user id on success
-
      */
-
     private function verifyWsToken(string $token) {
-
         $parts = explode('.', $token, 2);
-
-        if (count($parts) !== 2) {
-
-            return null;
-
-        }
-
-
+        if (count($parts) !== 2) return null;
 
         list($payloadB64, $sigB64) = $parts;
-
         $payloadJson = base64_decode(strtr($payloadB64, '-_', '+/'), true);
-
-        if ($payloadJson === false || $payloadJson === '') {
-
-            return null;
-
-        }
-
-
+        if ($payloadJson === false || $payloadJson === '') return null;
 
         $expectedSig = hash_hmac('sha256', $payloadJson, $this->wsSecret, true);
-
-        $sig         = base64_decode(strtr($sigB64, '-_', '+/'), true);
-
-        if (!is_string($sig) || !hash_equals($expectedSig, $sig)) {
-
-            return null;
-
-        }
-
-
+        $sig = base64_decode(strtr($sigB64, '-_', '+/'), true);
+        if (!is_string($sig) || !hash_equals($expectedSig, $sig)) return null;
 
         $payload = json_decode($payloadJson, true);
+        if (!is_array($payload) || empty($payload['uid']) || empty($payload['exp'])) return null;
 
-        if (!is_array($payload) || empty($payload['uid']) || empty($payload['exp'])) {
-
-            return null;
-
-        }
-
-
-
-        if ((int) $payload['exp'] < time()) {
-
-            return null;
-
-        }
-
-
+        if ((int) $payload['exp'] < time()) return null;
 
         return (int) $payload['uid'];
-
     }
-
-
 
     private function handleJoinNote(ConnectionInterface $from, array $data) {
-
         $note_id = intval($data['note_id'] ?? 0);
-
-        if (!$note_id || $from->user_id <= 0) {
-
-            return;
-
-        }
-
-
+        if (!$note_id || $from->user_id <= 0) return;
 
         if (!$this->userCanAccessNote((int) $from->user_id, $note_id)) {
-
             $from->send(json_encode([
-
                 'type'    => 'join_denied',
-
                 'note_id' => $note_id,
-
                 'message' => 'Không có quyền tham gia ghi chú này',
-
             ]));
-
             echo "[WS] join_denied user={$from->user_id} note=$note_id\n";
-
             return;
-
         }
-
-
 
         $this->noteSubscriptions[$note_id][$from->resourceId] = [
-
             'conn'      => $from,
-
             'user_name' => $from->user_name,
-
         ];
-
         echo "[WS] User {$from->user_id} joined note $note_id\n";
 
-
-
         $this->broadcastPresence($note_id);
-
     }
-
-
 
     /**
-
      * Owner or any active share recipient (same rules as viewing note).
-
      */
-
     private function userCanAccessNote(int $userId, int $noteId) {
-
         $sql = 'SELECT 1 FROM notes n WHERE n.id = ? AND n.is_trashed = 0 AND (
-
             n.user_id = ?
-
             OR EXISTS (
-
                 SELECT 1 FROM shared_notes sn
-
                 INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
-
                 WHERE sn.note_id = n.id
-
             )
-
         ) LIMIT 1';
-
         $st = $this->pdo->prepare($sql);
-
         $st->execute([$noteId, $userId, $userId]);
-
         return (bool) $st->fetchColumn();
-
     }
-
-
 
     /** Owner or shared with edit permission (matches client realtime for editors). */
-
     private function userCanEditNote(int $userId, int $noteId) {
-
         $st = $this->pdo->prepare('SELECT 1 FROM notes WHERE id = ? AND user_id = ? LIMIT 1');
-
         $st->execute([$noteId, $userId]);
-
-        if ($st->fetchColumn()) {
-
-            return true;
-
-        }
-
-
+        if ($st->fetchColumn()) return true;
 
         $st = $this->pdo->prepare(
-
             "SELECT 1 FROM shared_notes sn
-
              INNER JOIN users u ON u.id = ? AND sn.recipient_email = u.email
-
              WHERE sn.note_id = ? AND sn.permission = 'edit' LIMIT 1"
-
         );
-
         $st->execute([$userId, $noteId]);
-
         return (bool) $st->fetchColumn();
-
     }
-
-
-
-    /** Persisted notes.version (authoritative for optimistic HTTP saves). */
 
     private function fetchAuthoritativeNoteVersion(int $noteId) {
-
         $st = $this->pdo->prepare('SELECT version FROM notes WHERE id = ? AND is_trashed = 0 LIMIT 1');
-
         $st->execute([$noteId]);
-
         $v = $st->fetchColumn();
-
         return $v !== false ? (int) $v : null;
-
     }
-
-
 
     private function handleUpdate(ConnectionInterface $from, array $data) {
-
         $note_id = intval($data['note_id'] ?? 0);
+        if (!$note_id || !isset($this->noteSubscriptions[$note_id][$from->resourceId])) return;
 
-        if (
-
-            !$note_id
-
-            || !isset($this->noteSubscriptions[$note_id][$from->resourceId])
-
-        ) {
-
-            return;
-
-        }
-
-
-
-        if (!$this->userCanEditNote((int) $from->user_id, $note_id)) {
-
-            return;
-
-        }
-
-
+        if (!$this->userCanEditNote((int) $from->user_id, $note_id)) return;
 
         $dbVersion = $this->fetchAuthoritativeNoteVersion($note_id);
-
-        if ($dbVersion === null) {
-
-            return;
-
-        }
-
-
+        if ($dbVersion === null) return;
 
         $broadcastData = [
-
             'type'       => 'update',
-
             'note_id'    => $note_id,
-
             'user_name'  => $from->user_name,
-
             'title'      => $data['title'] ?? null,
-
             'content'    => $data['content'] ?? null,
-
             'version'    => $dbVersion,
-
             'sender_id'  => $from->resourceId,
-
             'timestamp'  => time(),
-
         ];
 
-
-
         foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
-
             if ($info['conn'] !== $from) {
-
                 $info['conn']->send(json_encode($broadcastData));
-
             }
-
         }
-
     }
-
-
 
     /**
-
      * Broadcast danh sách người đang xem ghi chú
-
      */
-
     private function broadcastPresence(int $note_id) {
-
         if (!isset($this->noteSubscriptions[$note_id])) return;
 
-
-
         $users = array_values(array_map(
-
-            function ($info) {
-
-                return $info['user_name'];
-
-            },
-
+            function ($info) { return $info['user_name']; },
             $this->noteSubscriptions[$note_id]
-
         ));
 
-
-
         $payload = json_encode([
-
             'type'    => 'presence',
-
             'note_id' => $note_id,
-
             'users'   => $users,
-
         ]);
 
-
-
         foreach ($this->noteSubscriptions[$note_id] as $info) {
-
             $info['conn']->send($payload);
-
         }
-
     }
-
-
 
     private function removeFromNote(ConnectionInterface $conn, int $note_id) {
-
         if ($note_id && isset($this->noteSubscriptions[$note_id])) {
-
             unset($this->noteSubscriptions[$note_id][$conn->resourceId]);
-
-
-
             if (empty($this->noteSubscriptions[$note_id])) {
-
                 unset($this->noteSubscriptions[$note_id]);
-
             } else {
-
                 $this->broadcastPresence($note_id);
-
             }
-
         }
-
     }
-
-
 
     public function onClose(ConnectionInterface $conn) {
-
         foreach (array_keys($this->noteSubscriptions) as $note_id) {
-
             $this->removeFromNote($conn, (int) $note_id);
-
         }
-
         $this->clients->detach($conn);
-
         echo "[WS] Connection closed: {$conn->resourceId}\n";
-
     }
-
-
 
     public function onError(ConnectionInterface $conn, \Exception $e) {
-
         echo "[WS] Error: {$e->getMessage()}\n";
-
         $conn->close();
-
     }
 
-}
+    // ==================== CÁC PHƯƠNG THỨC MỚI ====================
+    /**
+     * Broadcast color change to all viewers of the note
+     */
+    private function handleColorUpdate(ConnectionInterface $from, array $data) {
+        $note_id = intval($data['note_id'] ?? 0);
+        if (!$note_id || $from->user_id <= 0) return;
+        if (!$this->userCanEditNote((int) $from->user_id, $note_id)) return;
 
+        $color = $data['color'] ?? '';
+
+        if (isset($this->noteSubscriptions[$note_id])) {
+            $broadcastData = [
+                'type'      => 'color_update',
+                'note_id'   => $note_id,
+                'color'     => $color,
+                'user_name' => $from->user_name,
+            ];
+            foreach ($this->noteSubscriptions[$note_id] as $resourceId => $info) {
+                if ($info['conn'] !== $from) {
+                    $info['conn']->send(json_encode($broadcastData));
+                }
+            }
+        }
+    }
+
+    /**
+     * Broadcast image added to all viewers
+     */
+    private function handleImageAdded(ConnectionInterface $from, array $data) {
+        $note_id = intval($data['note_id'] ?? 0);
+        if (!$note_id || $from->user_id <= 0) return;
+        if (!$this->userCanEditNote($from->user_id, $note_id)) return;
+
+        $image_id = intval($data['image_id'] ?? 0);
+        $file_path = $data['file_path'] ?? '';
+
+        if (isset($this->noteSubscriptions[$note_id])) {
+            $broadcastData = [
+                'type'      => 'image_added',
+                'note_id'   => $note_id,
+                'image_id'  => $image_id,
+                'file_path' => $file_path,
+                'user_name' => $from->user_name,
+            ];
+            foreach ($this->noteSubscriptions[$note_id] as $info) {
+                if ($info['conn'] !== $from) {
+                    $info['conn']->send(json_encode($broadcastData));
+                }
+            }
+        }
+    }
+
+    /**
+     * Broadcast image deleted to all viewers
+     */
+    private function handleImageDeleted(ConnectionInterface $from, array $data) {
+        $note_id = intval($data['note_id'] ?? 0);
+        if (!$note_id || $from->user_id <= 0) return;
+        if (!$this->userCanEditNote($from->user_id, $note_id)) return;
+
+        $image_id = intval($data['image_id'] ?? 0);
+
+        if (isset($this->noteSubscriptions[$note_id])) {
+            $broadcastData = [
+                'type'      => 'image_deleted',
+                'note_id'   => $note_id,
+                'image_id'  => $image_id,
+                'user_name' => $from->user_name,
+            ];
+            foreach ($this->noteSubscriptions[$note_id] as $info) {
+                if ($info['conn'] !== $from) {
+                    $info['conn']->send(json_encode($broadcastData));
+                }
+            }
+        }
+    }
+}
 
 //----//
 
@@ -3337,7 +3124,53 @@ body[data-bs-theme="dark"] .shared-banner,
         color: var(--text-on-glass-dark);
     }
 }
+/* =========================================================
+   DARK MODE - CUSTOM NOTE COLOR CONTRAST FIX
+   ========================================================= */
+body[data-bs-theme="dark"] .note-card[style*="background"],
+body[data-bs-theme="dark"] .note-card[style*="background-color"],
+[data-bs-theme="dark"] .note-card[style*="background"],
+[data-bs-theme="dark"] .note-card[style*="background-color"] {
+    /* Override mọi màu text mặc định của dark mode */
+    color: #0A1024 !important;
+}
 
+body[data-bs-theme="dark"] .note-card[style*="background"] .card-title,
+body[data-bs-theme="dark"] .note-card[style*="background"] .card-text,
+body[data-bs-theme="dark"] .note-card[style*="background"] p,
+body[data-bs-theme="dark"] .note-card[style*="background"] span,
+body[data-bs-theme="dark"] .note-card[style*="background"] small,
+[data-bs-theme="dark"] .note-card[style*="background"] .card-title,
+[data-bs-theme="dark"] .note-card[style*="background"] .card-text {
+    color: #0A1024 !important;
+}
+
+/* Cho modal khi có màu nền tùy chỉnh trong dark mode */
+body[data-bs-theme="dark"] .modal-content[style*="background"],
+body[data-bs-theme="dark"] .modal-content[style*="background-color"],
+[data-bs-theme="dark"] .modal-content[style*="background"],
+[data-bs-theme="dark"] .modal-content[style*="background-color"] {
+    color: #0A1024 !important;
+}
+
+body[data-bs-theme="dark"] .modal-content[style*="background"] .modal-title,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .modal-body,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+body[data-bs-theme="dark"] .modal-content[style*="background"] label,
+[data-bs-theme="dark"] .modal-content[style*="background"] .modal-title,
+[data-bs-theme="dark"] .modal-content[style*="background"] .modal-body {
+    color: #0A1024 !important;
+}
+
+/* Input trong modal màu nền tùy chỉnh */
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+body[data-bs-theme="dark"] .modal-content[style*="background"] .form-select,
+[data-bs-theme="dark"] .modal-content[style*="background"] .form-control,
+[data-bs-theme="dark"] .modal-content[style*="background"] .form-select {
+    background: rgba(255,255,255,0.85) !important;
+    color: #0A1024 !important;
+    border-color: rgba(0,0,0,0.2) !important;
+}
 /* =========================================================
    PERFORMANCE
    ========================================================= */
@@ -3433,6 +3266,7 @@ h1, h2, h3, h4, h5, h6, p, span, div {
     filter: none !important;
     opacity: 0.75;
 }
+
 
 //----//
 
@@ -3608,6 +3442,15 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+    // Khôi phục màu nền mặc định từ session nếu có
+    const savedNoteColor = localStorage.getItem('noteapp_note_color') || document.documentElement.style.getPropertyValue('--note-default-color');
+    if (savedNoteColor) {
+        document.documentElement.style.setProperty('--note-default-color', savedNoteColor);
+    }
+    // Lưu lại khi người dùng thay đổi trong profile
+    document.getElementById('settingNoteColor')?.addEventListener('change', function() {
+        localStorage.setItem('noteapp_note_color', this.value);
+    });
 });
 
 // ====================== REALTIME TYPING BROADCAST (80ms debounce) ======================
@@ -4653,103 +4496,135 @@ function connectWebSocket() {
                 _setWsStatus('connecting');
             };
 
-            socket.onmessage = (event) => {
-                if (ws !== socket) return;
-                try {
-                    const data = JSON.parse(event.data);
+       socket.onmessage = (event) => {
+    if (ws !== socket) return;
+    try {
+        const data = JSON.parse(event.data);
 
-                    if (data.type === 'auth_error') {
-                        wsReady = false;
-                        _setWsStatus('offline');
-                        try { socket.close(); } catch (e2) {}
-                        return;
-                    }
+        if (data.type === 'auth_error') {
+            wsReady = false;
+            _setWsStatus('offline');
+            try { socket.close(); } catch (e2) {}
+            return;
+        }
 
-                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
-                        console.warn('[WS] join_denied:', data.message || '');
-                        return;
-                    }
+        if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+            console.warn('[WS] join_denied:', data.message || '');
+            return;
+        }
 
-                    if (data.type === 'auth_success') {
-                        wsReady = true;
-                        _setWsStatus('online');
-                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
-                    }
+        if (data.type === 'auth_success') {
+            wsReady = true;
+            _setWsStatus('online');
+            if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+        }
 
-                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-                        if (data.user_name === currentUserName) return;
+        if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+            if (data.user_name === currentUserName) return;
 
-                        const contentElPre = document.getElementById('noteContent');
-                        const incomingVer = data.version != null && data.version !== ''
-                            ? parseInt(data.version, 10)
-                            : NaN;
-                        const rawLocal = contentElPre && contentElPre.dataset.version;
-                        const localVer = rawLocal !== undefined && rawLocal !== ''
-                            ? parseInt(rawLocal, 10)
-                            : NaN;
-                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
-                            return;
-                        }
+            const contentElPre = document.getElementById('noteContent');
+            const incomingVer = data.version != null && data.version !== ''
+                ? parseInt(data.version, 10)
+                : NaN;
+            const rawLocal = contentElPre && contentElPre.dataset.version;
+            const localVer = rawLocal !== undefined && rawLocal !== ''
+                ? parseInt(rawLocal, 10)
+                : NaN;
+            if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                return;
+            }
 
-                        const c = String(data.content ?? '');
-                        const inboundKey = [
-                            data.note_id,
-                            data.user_name,
-                            data.timestamp ?? '',
-                            data.title ?? '',
-                            c.length,
-                            c.slice(0, 256)
-                        ].join('\x1e');
-                        if (inboundKey === _lastWsInboundKey) return;
-                        _lastWsInboundKey = inboundKey;
+            const c = String(data.content ?? '');
+            const inboundKey = [
+                data.note_id,
+                data.user_name,
+                data.timestamp ?? '',
+                data.title ?? '',
+                c.length,
+                c.slice(0, 256)
+            ].join('\x1e');
+            if (inboundKey === _lastWsInboundKey) return;
+            _lastWsInboundKey = inboundKey;
 
-                        const titleEl   = document.getElementById('noteTitle');
-                        const contentEl = document.getElementById('noteContent');
+            const titleEl   = document.getElementById('noteTitle');
+            const contentEl = document.getElementById('noteContent');
 
-                        const isEditingTitle   = document.activeElement === titleEl;
-                        const isEditingContent = document.activeElement === contentEl;
+            const isEditingTitle   = document.activeElement === titleEl;
+            const isEditingContent = document.activeElement === contentEl;
 
-                        window.__remoteUpdating = true;
-                        try {
-                            if (data.version != null && data.version !== '') {
-                                contentEl.dataset.version = String(data.version);
-                            }
-
-                            if (data.title !== undefined && !isEditingTitle) {
-                                titleEl.value = data.title;
-                            }
-
-                            if (data.content !== undefined) {
-                                const currentContent  = contentEl.value    || '';
-                                const incomingContent = String(data.content);
-
-                                if (!isEditingContent) {
-                                    contentEl.value = incomingContent;
-                                } else {
-                                    const isDeleting   = incomingContent.length < currentContent.length;
-                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                                    if (isDeleting || tooDifferent) {
-                                        const cursorPos = contentEl.selectionStart;
-                                        contentEl.value = incomingContent;
-                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
-                                    }
-                                }
-                            }
-                        } finally {
-                            window.__remoteUpdating = false;
-                        }
-
-                        _showTypingIndicator(data.user_name);
-                    }
-
-                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-                        _renderPresence(data.users);
-                    }
-                } catch (e) {
-                    console.error('WS parse error:', e);
+            window.__remoteUpdating = true;
+            try {
+                if (data.version != null && data.version !== '') {
+                    contentEl.dataset.version = String(data.version);
                 }
-            };
+
+                if (data.title !== undefined && !isEditingTitle) {
+                    titleEl.value = data.title;
+                }
+
+                if (data.content !== undefined) {
+                    const currentContent  = contentEl.value    || '';
+                    const incomingContent = String(data.content);
+
+                    if (!isEditingContent) {
+                        contentEl.value = incomingContent;
+                    } else {
+                        const isDeleting   = incomingContent.length < currentContent.length;
+                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                        if (isDeleting || tooDifferent) {
+                            const cursorPos = contentEl.selectionStart;
+                            contentEl.value = incomingContent;
+                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                        }
+                    }
+                }
+            } finally {
+                window.__remoteUpdating = false;
+            }
+
+            _showTypingIndicator(data.user_name);
+        }
+
+        // ========== XỬ LÝ MÀU SẮC ==========
+        if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
+            const modalWrapper = document.getElementById('modalContentWrapper');
+            if (modalWrapper) {
+                modalWrapper.style.backgroundColor = data.color;
+                modalWrapper.style.setProperty('--note-individual-color', data.color);
+            }
+            // Cập nhật card trong danh sách nếu có
+            const cards = document.querySelectorAll('.note-card');
+            cards.forEach(card => {
+                const body = card.querySelector('.card-body');
+                if (body && body.dataset.id == data.note_id) {
+                    card.style.backgroundColor = data.color;
+                }
+            });
+            _showTypingIndicator(data.user_name + ' đã đổi màu');
+        }
+
+        // ========== XỬ LÝ THÊM ẢNH ==========
+        if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
+            // Gọi hàm renderImage với permission hiện tại
+            renderImage(data.file_path, data.image_id, currentPermission);
+            _showTypingIndicator(data.user_name + ' đã thêm ảnh');
+        }
+
+        // ========== XỬ LÝ XÓA ẢNH ==========
+        if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
+            const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
+            if (imgDiv) imgDiv.remove();
+            _showTypingIndicator(data.user_name + ' đã xóa ảnh');
+        }
+
+        if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+            _renderPresence(data.users);
+        }
+    } catch (e) {
+        console.error('WS parse error:', e);
+    }
+};
 
             socket.onclose = () => {
                 if (ws !== socket) return;
@@ -4876,11 +4751,11 @@ function stopRealtime() {
 // ====================== ẢNH ======================
 function uploadImage() {
     const nid = document.getElementById('noteId').value;
-    const f   = document.getElementById('imageInput').files[0];
+    const f = document.getElementById('imageInput').files[0];
     if (!f) return;
 
     const fd = new FormData();
-    fd.append('image',   f);
+    fd.append('image', f);
     fd.append('note_id', nid);
     appendCsrfToken(fd);
 
@@ -4889,6 +4764,16 @@ function uploadImage() {
         .then(d => {
             if (d.success) {
                 renderImage(d.file_path, d.image_id, 'owner');
+                // Broadcast image added
+                if (wsReady && currentNoteIdForWS == nid) {
+                    _wsSend({
+                        type: 'image_added',
+                        note_id: nid,
+                        image_id: d.image_id,
+                        file_path: d.file_path,
+                        user_name: currentUserName
+                    });
+                }
             } else {
                 showAlert(d.message || 'Không thể upload ảnh', 'danger');
             }
@@ -4904,18 +4789,32 @@ function renderImage(path, id, perm) {
              onclick="deleteImage(${id},this)"><i class="bi bi-x"></i></button>`
         : '';
     document.getElementById('imagePreviewContainer').innerHTML +=
-        `<div class="position-relative shadow-sm rounded">
-            <img src="${path}" class="img-thumbnail" style="width:120px;height:120px;object-fit:cover;">${del}
+        `<div class="position-relative shadow-sm rounded" data-image-id="${id}">
+            <img src="${path}" class="img-thumbnail" style="width:120px;height:120px;object-fit:cover;" data-id="${id}">${del}
          </div>`;
 }
 
 function deleteImage(id, btn) {
     showConfirm('Xóa ảnh này?', () => {
         fetch('api/delete_image.php', {
-            method:  'POST',
+            method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body:    `id=${id}`
-        }).then(r => r.json()).then(d => { if (d.success) btn.parentElement.remove(); });
+            body: `id=${id}`
+        }).then(r => r.json()).then(d => {
+            if (d.success) {
+                const imgDiv = btn.closest('[data-image-id]');
+                if (imgDiv) imgDiv.remove();
+                // Broadcast image deleted
+                if (wsReady && currentNoteIdForWS) {
+                    _wsSend({
+                        type: 'image_deleted',
+                        note_id: currentNoteIdForWS,
+                        image_id: id,
+                        user_name: currentUserName
+                    });
+                }
+            }
+        });
     });
 }
 
@@ -5031,19 +4930,26 @@ function saveProfile() {
     const avatarFile = document.getElementById('inputAvatar').files[0];
     if (avatarFile) fd.append('avatar', avatarFile);
 
-    const fontSize  = document.getElementById('settingFontSize').value;
-    const theme     = document.getElementById('settingTheme').value;
+    const fontSize = document.getElementById('settingFontSize').value;
+    const theme = document.getElementById('settingTheme').value;
     const noteColor = document.getElementById('settingNoteColor').value;
 
-    fd.append('font_size',   fontSize);
+    fd.append('font_size', fontSize);
     fd.append('theme_color', theme);
-    fd.append('note_color',  noteColor);
+    fd.append('note_color', noteColor);
     appendCsrfToken(fd);
 
+    // Áp dụng ngay lập tức cho giao diện
     applyTheme(theme);
     document.documentElement.style.fontSize = fontSize;
-    document.body.style.fontSize            = fontSize;
+    document.body.style.fontSize = fontSize;
     document.documentElement.style.setProperty('--note-default-color', noteColor);
+    // Cập nhật màu cho tất cả các note card hiện tại (nếu không có màu riêng)
+    document.querySelectorAll('.note-card').forEach(card => {
+        if (!card.style.backgroundColor) {
+            card.style.backgroundColor = noteColor;
+        }
+    });
 
     fetch('api/update_profile.php', { method: 'POST', body: fd })
         .then(r => r.json())
@@ -5074,6 +4980,11 @@ function previewImage(input) {
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     localStorage.setItem('noteapp_theme', theme);
+    // Đảm bảo màu nền mặc định được giữ nguyên
+    const defaultColor = document.documentElement.style.getPropertyValue('--note-default-color');
+    if (defaultColor) {
+        document.documentElement.style.setProperty('--note-default-color', defaultColor);
+    }
 }
 
 // ====================== TIỆN ÍCH ======================
@@ -5093,27 +5004,59 @@ function togglePin(id, state) {
 
 function changeColor(color) {
     const id = document.getElementById('noteId').value;
-    if (!id) { showAlert('Vui lòng lưu ghi chú trước khi đổi màu!', 'warning'); return; }
+    if (!id) {
+        showAlert('Vui lòng lưu ghi chú trước khi đổi màu!', 'warning');
+        return;
+    }
 
     const fd = new FormData();
-    fd.append('id',         id);
-    fd.append('color',      color || '');
+    fd.append('id', id);
+    fd.append('color', color || '');
     appendCsrfToken(fd);
+
+    const modalWrapper = document.getElementById('modalContentWrapper');
+    if (modalWrapper) {
+        modalWrapper.style.backgroundColor = color || '';
+        modalWrapper.style.setProperty('--note-individual-color', color || '');
+    }
+
+    if (!navigator.onLine) {
+        queueAction('api/change_color.php', fd);
+        showToast('Đã lưu thay đổi màu (offline)', 'success');
+        liveSearch();
+        return;
+    }
 
     fetch('api/change_color.php', { method: 'POST', body: fd })
         .then(res => res.json())
         .then(d => {
             if (d.success) {
-                const modalWrapper = document.getElementById('modalContentWrapper');
-                modalWrapper.style.backgroundColor = color || '';
-                modalWrapper.style.setProperty('--note-individual-color', color || '');
+                showToast('Đã đổi màu ghi chú thành công', 'success');
+                // Broadcast color change via WebSocket
+                if (wsReady && currentNoteIdForWS == id) {
+                    _wsSend({
+                        type: 'color_update',
+                        note_id: id,
+                        color: color || '',
+                        user_name: currentUserName
+                    });
+                }
                 liveSearch();
-                showAlert('Đã đổi màu ghi chú thành công', 'success');
             } else {
-                showAlert('Không thể đổi màu ghi chú!', 'danger');
+                showAlert(d.message || 'Không thể đổi màu!', 'danger');
+                if (modalWrapper) {
+                    modalWrapper.style.backgroundColor = '';
+                    modalWrapper.style.removeProperty('--note-individual-color');
+                }
             }
         })
-        .catch(() => showAlert('Lỗi kết nối!', 'danger'));
+        .catch(() => {
+            showAlert('Lỗi kết nối, vui lòng thử lại!', 'danger');
+            if (modalWrapper) {
+                modalWrapper.style.backgroundColor = '';
+                modalWrapper.style.removeProperty('--note-individual-color');
+            }
+        });
 }
 
 function formatRelativeTime(datetime) {

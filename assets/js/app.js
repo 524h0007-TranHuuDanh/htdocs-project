@@ -1223,103 +1223,135 @@ function connectWebSocket() {
                 _setWsStatus('connecting');
             };
 
-            socket.onmessage = (event) => {
-                if (ws !== socket) return;
-                try {
-                    const data = JSON.parse(event.data);
+       socket.onmessage = (event) => {
+    if (ws !== socket) return;
+    try {
+        const data = JSON.parse(event.data);
 
-                    if (data.type === 'auth_error') {
-                        wsReady = false;
-                        _setWsStatus('offline');
-                        try { socket.close(); } catch (e2) {}
-                        return;
-                    }
+        if (data.type === 'auth_error') {
+            wsReady = false;
+            _setWsStatus('offline');
+            try { socket.close(); } catch (e2) {}
+            return;
+        }
 
-                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
-                        console.warn('[WS] join_denied:', data.message || '');
-                        return;
-                    }
+        if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+            console.warn('[WS] join_denied:', data.message || '');
+            return;
+        }
 
-                    if (data.type === 'auth_success') {
-                        wsReady = true;
-                        _setWsStatus('online');
-                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
-                    }
+        if (data.type === 'auth_success') {
+            wsReady = true;
+            _setWsStatus('online');
+            if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+        }
 
-                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-                        if (data.user_name === currentUserName) return;
+        if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+            if (data.user_name === currentUserName) return;
 
-                        const contentElPre = document.getElementById('noteContent');
-                        const incomingVer = data.version != null && data.version !== ''
-                            ? parseInt(data.version, 10)
-                            : NaN;
-                        const rawLocal = contentElPre && contentElPre.dataset.version;
-                        const localVer = rawLocal !== undefined && rawLocal !== ''
-                            ? parseInt(rawLocal, 10)
-                            : NaN;
-                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
-                            return;
-                        }
+            const contentElPre = document.getElementById('noteContent');
+            const incomingVer = data.version != null && data.version !== ''
+                ? parseInt(data.version, 10)
+                : NaN;
+            const rawLocal = contentElPre && contentElPre.dataset.version;
+            const localVer = rawLocal !== undefined && rawLocal !== ''
+                ? parseInt(rawLocal, 10)
+                : NaN;
+            if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
+                return;
+            }
 
-                        const c = String(data.content ?? '');
-                        const inboundKey = [
-                            data.note_id,
-                            data.user_name,
-                            data.timestamp ?? '',
-                            data.title ?? '',
-                            c.length,
-                            c.slice(0, 256)
-                        ].join('\x1e');
-                        if (inboundKey === _lastWsInboundKey) return;
-                        _lastWsInboundKey = inboundKey;
+            const c = String(data.content ?? '');
+            const inboundKey = [
+                data.note_id,
+                data.user_name,
+                data.timestamp ?? '',
+                data.title ?? '',
+                c.length,
+                c.slice(0, 256)
+            ].join('\x1e');
+            if (inboundKey === _lastWsInboundKey) return;
+            _lastWsInboundKey = inboundKey;
 
-                        const titleEl   = document.getElementById('noteTitle');
-                        const contentEl = document.getElementById('noteContent');
+            const titleEl   = document.getElementById('noteTitle');
+            const contentEl = document.getElementById('noteContent');
 
-                        const isEditingTitle   = document.activeElement === titleEl;
-                        const isEditingContent = document.activeElement === contentEl;
+            const isEditingTitle   = document.activeElement === titleEl;
+            const isEditingContent = document.activeElement === contentEl;
 
-                        window.__remoteUpdating = true;
-                        try {
-                            if (data.version != null && data.version !== '') {
-                                contentEl.dataset.version = String(data.version);
-                            }
-
-                            if (data.title !== undefined && !isEditingTitle) {
-                                titleEl.value = data.title;
-                            }
-
-                            if (data.content !== undefined) {
-                                const currentContent  = contentEl.value    || '';
-                                const incomingContent = String(data.content);
-
-                                if (!isEditingContent) {
-                                    contentEl.value = incomingContent;
-                                } else {
-                                    const isDeleting   = incomingContent.length < currentContent.length;
-                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                                    if (isDeleting || tooDifferent) {
-                                        const cursorPos = contentEl.selectionStart;
-                                        contentEl.value = incomingContent;
-                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
-                                    }
-                                }
-                            }
-                        } finally {
-                            window.__remoteUpdating = false;
-                        }
-
-                        _showTypingIndicator(data.user_name);
-                    }
-
-                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-                        _renderPresence(data.users);
-                    }
-                } catch (e) {
-                    console.error('WS parse error:', e);
+            window.__remoteUpdating = true;
+            try {
+                if (data.version != null && data.version !== '') {
+                    contentEl.dataset.version = String(data.version);
                 }
-            };
+
+                if (data.title !== undefined && !isEditingTitle) {
+                    titleEl.value = data.title;
+                }
+
+                if (data.content !== undefined) {
+                    const currentContent  = contentEl.value    || '';
+                    const incomingContent = String(data.content);
+
+                    if (!isEditingContent) {
+                        contentEl.value = incomingContent;
+                    } else {
+                        const isDeleting   = incomingContent.length < currentContent.length;
+                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+
+                        if (isDeleting || tooDifferent) {
+                            const cursorPos = contentEl.selectionStart;
+                            contentEl.value = incomingContent;
+                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
+                        }
+                    }
+                }
+            } finally {
+                window.__remoteUpdating = false;
+            }
+
+            _showTypingIndicator(data.user_name);
+        }
+
+        // ========== XỬ LÝ MÀU SẮC ==========
+        if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
+            const modalWrapper = document.getElementById('modalContentWrapper');
+            if (modalWrapper) {
+                modalWrapper.style.backgroundColor = data.color;
+                modalWrapper.style.setProperty('--note-individual-color', data.color);
+            }
+            // Cập nhật card trong danh sách nếu có
+            const cards = document.querySelectorAll('.note-card');
+            cards.forEach(card => {
+                const body = card.querySelector('.card-body');
+                if (body && body.dataset.id == data.note_id) {
+                    card.style.backgroundColor = data.color;
+                }
+            });
+            _showTypingIndicator(data.user_name + ' đã đổi màu');
+        }
+
+        // ========== XỬ LÝ THÊM ẢNH ==========
+        if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
+            // Gọi hàm renderImage với permission hiện tại
+            renderImage(data.file_path, data.image_id, currentPermission);
+            _showTypingIndicator(data.user_name + ' đã thêm ảnh');
+        }
+
+        // ========== XỬ LÝ XÓA ẢNH ==========
+        if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
+            const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
+            if (imgDiv) imgDiv.remove();
+            _showTypingIndicator(data.user_name + ' đã xóa ảnh');
+        }
+
+        if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+            _renderPresence(data.users);
+        }
+    } catch (e) {
+        console.error('WS parse error:', e);
+    }
+};
 
             socket.onclose = () => {
                 if (ws !== socket) return;
@@ -1446,11 +1478,11 @@ function stopRealtime() {
 // ====================== ẢNH ======================
 function uploadImage() {
     const nid = document.getElementById('noteId').value;
-    const f   = document.getElementById('imageInput').files[0];
+    const f = document.getElementById('imageInput').files[0];
     if (!f) return;
 
     const fd = new FormData();
-    fd.append('image',   f);
+    fd.append('image', f);
     fd.append('note_id', nid);
     appendCsrfToken(fd);
 
@@ -1459,6 +1491,16 @@ function uploadImage() {
         .then(d => {
             if (d.success) {
                 renderImage(d.file_path, d.image_id, 'owner');
+                // Broadcast image added
+                if (wsReady && currentNoteIdForWS == nid) {
+                    _wsSend({
+                        type: 'image_added',
+                        note_id: nid,
+                        image_id: d.image_id,
+                        file_path: d.file_path,
+                        user_name: currentUserName
+                    });
+                }
             } else {
                 showAlert(d.message || 'Không thể upload ảnh', 'danger');
             }
@@ -1474,18 +1516,32 @@ function renderImage(path, id, perm) {
              onclick="deleteImage(${id},this)"><i class="bi bi-x"></i></button>`
         : '';
     document.getElementById('imagePreviewContainer').innerHTML +=
-        `<div class="position-relative shadow-sm rounded">
-            <img src="${path}" class="img-thumbnail" style="width:120px;height:120px;object-fit:cover;">${del}
+        `<div class="position-relative shadow-sm rounded" data-image-id="${id}">
+            <img src="${path}" class="img-thumbnail" style="width:120px;height:120px;object-fit:cover;" data-id="${id}">${del}
          </div>`;
 }
 
 function deleteImage(id, btn) {
     showConfirm('Xóa ảnh này?', () => {
         fetch('api/delete_image.php', {
-            method:  'POST',
+            method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body:    `id=${id}`
-        }).then(r => r.json()).then(d => { if (d.success) btn.parentElement.remove(); });
+            body: `id=${id}`
+        }).then(r => r.json()).then(d => {
+            if (d.success) {
+                const imgDiv = btn.closest('[data-image-id]');
+                if (imgDiv) imgDiv.remove();
+                // Broadcast image deleted
+                if (wsReady && currentNoteIdForWS) {
+                    _wsSend({
+                        type: 'image_deleted',
+                        note_id: currentNoteIdForWS,
+                        image_id: id,
+                        user_name: currentUserName
+                    });
+                }
+            }
+        });
     });
 }
 
@@ -1685,16 +1741,11 @@ function changeColor(color) {
     fd.append('color', color || '');
     appendCsrfToken(fd);
 
-    // Cập nhật UI ngay lập tức (optimistic)
     const modalWrapper = document.getElementById('modalContentWrapper');
-    const resolvedColor = (color && color.trim() !== '') ? color : '';
     if (modalWrapper) {
-        modalWrapper.style.backgroundColor = resolvedColor;
-        modalWrapper.style.setProperty('--note-individual-color', resolvedColor);
+        modalWrapper.style.backgroundColor = color || '';
+        modalWrapper.style.setProperty('--note-individual-color', color || '');
     }
-    // Cập nhật card tương ứng trong danh sách nếu đang mở (sẽ được refresh sau)
-    // Hiển thị thông báo tạm thời
-    showToast('Đang cập nhật màu...', 'info');
 
     if (!navigator.onLine) {
         queueAction('api/change_color.php', fd);
@@ -1708,10 +1759,18 @@ function changeColor(color) {
         .then(d => {
             if (d.success) {
                 showToast('Đã đổi màu ghi chú thành công', 'success');
-                liveSearch(); // Refresh danh sách để cập nhật màu card
+                // Broadcast color change via WebSocket
+                if (wsReady && currentNoteIdForWS == id) {
+                    _wsSend({
+                        type: 'color_update',
+                        note_id: id,
+                        color: color || '',
+                        user_name: currentUserName
+                    });
+                }
+                liveSearch();
             } else {
                 showAlert(d.message || 'Không thể đổi màu!', 'danger');
-                // Rollback UI nếu cần
                 if (modalWrapper) {
                     modalWrapper.style.backgroundColor = '';
                     modalWrapper.style.removeProperty('--note-individual-color');
@@ -1720,7 +1779,6 @@ function changeColor(color) {
         })
         .catch(() => {
             showAlert('Lỗi kết nối, vui lòng thử lại!', 'danger');
-            // Rollback
             if (modalWrapper) {
                 modalWrapper.style.backgroundColor = '';
                 modalWrapper.style.removeProperty('--note-individual-color');
