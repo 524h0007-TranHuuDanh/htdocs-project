@@ -3,6 +3,8 @@
 const currentUserId   = window.APP_CONFIG?.userId   ?? 0;
 const currentUserName = window.APP_CONFIG?.userName  ?? 'User';
 
+let currentTempId = null;        // ID tạm duy nhất cho note mới khi offline
+let offlineActionsDb = null;     // DB cho hành động offline (xóa, đổi màu, ...)
 let renameLabelId = null;
 let renameLabelCurrentName = '';
 let typingTimer, searchTimer;
@@ -155,6 +157,16 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+    // ========== THÊM VÀO ĐÂY ==========
+    const titleInput = document.getElementById('noteTitle');
+    const contentInput = document.getElementById('noteContent');
+    if (titleInput) {
+        titleInput.addEventListener('input', () => autoSave());
+    }
+    if (contentInput) {
+        contentInput.addEventListener('input', () => autoSave());
+    }
+    // ==================================
 
     // --- Bảo vệ modal không đóng khi đang gõ ---
     const noteModalEl = document.getElementById('noteModal');
@@ -258,13 +270,14 @@ async function liveSearch() {
     clearTimeout(searchTimer);
 
     searchTimer = setTimeout(async () => {
+        // Nếu không có mạng, chỉ hiển thị offline và không gọi fetch
         if (!navigator.onLine) {
-            const hasOffline = await loadNotesOfflineFallback();
-            if (hasOffline) return;
+            await loadNotesOfflineFallback();
+            return;
         }
 
-        const q   = encodeURIComponent(document.getElementById('searchInput').value);
-        let url   = `api/search.php?q=${q}&view=${currentViewMode}`;
+        const q = encodeURIComponent(document.getElementById('searchInput').value);
+        let url = `api/search.php?q=${q}&view=${currentViewMode}`;
         if (currentLabelId && currentViewMode === 'my_notes') url += `&label_id=${currentLabelId}`;
 
         fetch(url)
@@ -275,7 +288,6 @@ async function liveSearch() {
             });
     }, 300);
 }
-
 function scheduleLiveSearchAfterSave() {
     clearTimeout(liveSearchAfterSaveTimer);
     liveSearchAfterSaveTimer = setTimeout(() => {
@@ -639,24 +651,39 @@ function submitNotePassword() {
 }
 
 function openNoteModal(id = '', title = '', content = '', color = '', permission = 'owner', ownerName = '') {
-    // Reset biến đếm retry khi mở một note mới
     window._conflictRetryCount = 0;
 
-    currentPermission = permission;
-    currentNoteId     = id;
+    // ---- Quản lý ID tạm khi offline ----
+    if (!id && !navigator.onLine && !currentTempId) {
+        currentTempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        console.log('[Offline] Created persistent temp id:', currentTempId);
+    }
+    let finalId = id;
+    if (!id && !navigator.onLine) {
+        finalId = currentTempId;
+    } else if (!id && navigator.onLine) {
+        finalId = '';
+    }
+    if (!finalId && !navigator.onLine) {
+        if (!currentTempId) {
+            currentTempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+        }
+        finalId = currentTempId;
+    }
 
-    document.getElementById('noteId').value      = id;
-    document.getElementById('noteTitle').value   = title;
+    currentPermission = permission;
+    currentNoteId = finalId;
+    document.getElementById('noteId').value = finalId;
+    document.getElementById('noteTitle').value = title;
     document.getElementById('noteContent').value = content;
 
     const contentEl = document.getElementById('noteContent');
     delete contentEl.dataset.version;
-    // Đặt version tạm thời là '0' (sẽ được cập nhật sau khi fetch từ server)
     contentEl.dataset.version = '0';
 
     document.getElementById('imagePreviewContainer').innerHTML = '';
-    document.getElementById('noteLabelsContainer').innerHTML   = '';
-    document.getElementById('saveStatus').innerText            = '';
+    document.getElementById('noteLabelsContainer').innerHTML = '';
+    document.getElementById('saveStatus').innerText = '';
     lastAutoSavePersistSig = '';
     noteConflictResolutionLock = false;
     clearTimeout(autoSaveTimer);
@@ -665,103 +692,112 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
     clearTimeout(liveSearchAfterSaveTimer);
     clearTimeout(realtimeTypingTimer);
     liveSearchAfterSaveTimer = null;
-    autoSaveTimer          = null;
-    autoSaveRetryTimer     = null;
-    autoSaveBusyTimer      = null;
-    realtimeTypingTimer    = null;
+    autoSaveTimer = null;
+    autoSaveRetryTimer = null;
+    autoSaveBusyTimer = null;
+    realtimeTypingTimer = null;
     autoSaveInFlightSeq++;
 
-    if (id) {
+    // Chỉ fetch phiên bản khi có id thật và có mạng
+    if (finalId && !isNoteTemp(finalId) && navigator.onLine) {
         noteVersionLoadPending = true;
         const fetchGen = ++noteVersionFetchGen;
-        fetch(`api/get_notes.php?note_id=${id}`)
+        fetch(`api/get_notes.php?note_id=${finalId}`)
             .then(r => r.json())
             .then(note => {
-                if (note != null && note.version != null && note.version !== '') {
+                if (note && note.version != null) {
                     contentEl.dataset.version = String(note.version);
                 }
             })
-            .catch(() => { /* giữ nguyên version '0' nếu fetch lỗi */ })
+            .catch(() => {})
             .finally(() => {
-                if (fetchGen === noteVersionFetchGen) {
-                    noteVersionLoadPending = false;
-                }
+                if (fetchGen === noteVersionFetchGen) noteVersionLoadPending = false;
             });
     } else {
         noteVersionFetchGen++;
         noteVersionLoadPending = false;
     }
 
-    // --- Áp dụng màu ghi chú ---
-    const modalWrapper  = document.getElementById('modalContentWrapper');
-    const resolvedColor = (color && color.trim() !== '')
-        ? color
-        : (document.documentElement.style.getPropertyValue('--note-default-color') || '#ffffff');
+    // Màu sắc
+    const modalWrapper = document.getElementById('modalContentWrapper');
+    const resolvedColor = (color && color.trim()) ? color : (document.documentElement.style.getPropertyValue('--note-default-color') || '#ffffff');
     modalWrapper.style.backgroundColor = resolvedColor;
     modalWrapper.style.setProperty('--note-individual-color', resolvedColor);
 
-    // --- Ẩn tất cả các section trước ---
+    // Ẩn các section trước
     ['toolsSection','colorSection','shareManagerSection','btnTrashNote','btnRestoreNote','btnDeletePermanent']
         .forEach(el => { const e = document.getElementById(el); if (e) e.style.display = 'none'; });
 
-    const isTrash  = currentViewMode === 'trash';
+    const isTrash = currentViewMode === 'trash';
     const isShared = currentViewMode === 'shared';
-    const notice   = document.getElementById('sharedNotice');
-    const wsBadge  = document.getElementById('wsStatusBadge');
+    const notice = document.getElementById('sharedNotice');
+    const wsBadge = document.getElementById('wsStatusBadge');
 
     if (isTrash) {
         notice.style.display = 'none';
-        document.getElementById('noteTitle').readOnly   = true;
+        document.getElementById('noteTitle').readOnly = true;
         document.getElementById('noteContent').readOnly = true;
-        document.getElementById('btnRestoreNote').style.display     = 'block';
+        document.getElementById('btnRestoreNote').style.display = 'block';
         document.getElementById('btnDeletePermanent').style.display = 'block';
         if (wsBadge) wsBadge.style.display = 'none';
-
     } else if (isShared) {
         notice.style.display = 'block';
-        notice.innerHTML = `
-            <strong>Được chia sẻ bởi:</strong> <b>${escapeHtml(ownerName)}</b><br>
-            <strong>Quyền:</strong> <b>${permission === 'edit' ? '✅ Có thể chỉnh sửa' : '👁️ Chỉ xem'}</b>
-        `;
-        document.getElementById('noteTitle').readOnly   = permission === 'read';
+        notice.innerHTML = `<strong>Được chia sẻ bởi:</strong> <b>${escapeHtml(ownerName)}</b><br>
+                            <strong>Quyền:</strong> <b>${permission === 'edit' ? '✅ Có thể chỉnh sửa' : '👁️ Chỉ xem'}</b>`;
+        document.getElementById('noteTitle').readOnly = permission === 'read';
         document.getElementById('noteContent').readOnly = permission === 'read';
-        if (id) {
-            fetch(`api/get_note_images.php?note_id=${id}`)
+        // Chỉ gọi API khi có mạng
+        if (finalId && !isNoteTemp(finalId) && navigator.onLine) {
+            fetch(`api/get_note_images.php?note_id=${finalId}`)
                 .then(r => r.json())
                 .then(imgs => imgs.forEach(img => renderImage(img.file_path, img.id, permission)));
         }
         if (wsBadge) wsBadge.style.display = permission === 'edit' ? 'inline-flex' : 'none';
-
     } else {
+        // Chế độ my_notes (chủ sở hữu)
         notice.style.display = 'none';
-        document.getElementById('noteTitle').readOnly   = false;
+        document.getElementById('noteTitle').readOnly = false;
         document.getElementById('noteContent').readOnly = false;
 
-        if (id) {
-            setNoteOwnerToolbarVisible(true);
+        // *** Luôn hiển thị toolbar cho chủ sở hữu (kể cả offline và note tạm) ***
+        setNoteOwnerToolbarVisible(true);
 
-            fetch(`api/get_note_images.php?note_id=${id}`)
+        // Xử lý tải dữ liệu chỉ khi online và có ID thật
+        if (finalId && !isNoteTemp(finalId) && navigator.onLine) {
+            // Online: tải ảnh, nhãn, danh sách chia sẻ từ server
+            fetch(`api/get_note_images.php?note_id=${finalId}`)
                 .then(r => r.json())
                 .then(imgs => imgs.forEach(img => renderImage(img.file_path, img.id, 'owner')));
-            loadLabelsForNote(id);
+            loadLabelsForNote(finalId);
             refreshLabelSelector();
-            loadSharedUsers(id);
-            if (wsBadge) wsBadge.style.display = 'inline-flex';
+            loadSharedUsers(finalId);
+        } else if (finalId && isNoteTemp(finalId) && !navigator.onLine) {
+            // Offline với note tạm: hiển thị placeholder (không gọi API)
+            document.getElementById('imagePreviewContainer').innerHTML = '<div class="text-muted small">Ảnh sẽ được đồng bộ khi có mạng</div>';
+            document.getElementById('noteLabelsContainer').innerHTML = '<span class="text-muted small">Nhãn sẽ được đồng bộ</span>';
+            // Không gọi loadSharedUsers
+        } else if (!finalId && !navigator.onLine) {
+            // Tạo mới offline (chưa có ID) – hiển thị placeholder
+            document.getElementById('imagePreviewContainer').innerHTML = '<div class="text-muted small">Ảnh sẽ được đồng bộ khi có mạng</div>';
+            document.getElementById('noteLabelsContainer').innerHTML = '<span class="text-muted small">Nhãn sẽ được đồng bộ</span>';
         }
+
+        if (wsBadge) wsBadge.style.display = 'inline-flex';
     }
 
-    if (!id) {
-        document.getElementById('noteTitle').placeholder   = 'Nhập tiêu đề ghi chú...';
+    if (!finalId) {
+        document.getElementById('noteTitle').placeholder = 'Nhập tiêu đề ghi chú...';
         document.getElementById('noteContent').placeholder = 'Nhập nội dung ghi chú của bạn...';
     }
 
-    if (id && (permission === 'edit' || permission === 'owner')) {
-        startRealtimeForNote(id, permission);
+    // Khởi động realtime chỉ khi online và có ID thật
+    if (finalId && (permission === 'edit' || permission === 'owner') && !isNoteTemp(finalId) && navigator.onLine) {
+        startRealtimeForNote(finalId, permission);
     }
 
     noteModal.show();
 }
-// ====================== AUTO REFRESH ======================
+// ====================== AUTO REFRESH & AUTO SAVE ======================
 function startAutoRefresh() {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
     if (currentViewMode === 'shared' && currentPermission === 'edit') {
@@ -776,9 +812,10 @@ function closeAndReload() {
     stopRealtime();
     noteModal.hide();
     liveSearch();
+    // KHÔNG reset currentTempId ở đây! Giữ nguyên để tái sử dụng cho các lần mở modal tạo mới offline.
 }
 
-// ====================== AUTO SAVE ======================
+// ----- Hàm autoSave chính xác (chỉ một bản) -----
 function _autoSavePayloadSignature() {
     const noteId  = document.getElementById('noteId').value;
     const title   = document.getElementById('noteTitle').value.trim();
@@ -791,9 +828,9 @@ function autoSave() {
     if (window.__remoteUpdating) return;
     if (noteConflictResolutionLock) return;
 
-    const noteId  = document.getElementById('noteId').value;
+    const noteId = document.getElementById('noteId').value;
     if (noteId && noteVersionLoadPending) return;
-    const title   = document.getElementById('noteTitle').value.trim();
+    const title = document.getElementById('noteTitle').value.trim();
     const content = document.getElementById('noteContent').value;
 
     if (!noteId && !title && !content) return;
@@ -803,7 +840,7 @@ function autoSave() {
     clearTimeout(autoSaveRetryTimer);
     clearTimeout(autoSaveBusyTimer);
     autoSaveRetryTimer = null;
-    autoSaveBusyTimer  = null;
+    autoSaveBusyTimer = null;
 
     if (!hadPendingDebounce) {
         document.getElementById('saveStatus').innerHTML = '<i class="bi bi-hourglass-split"></i> Đang lưu...';
@@ -839,22 +876,34 @@ function autoSave() {
                 return;
             }
 
+            // ---------- OFFLINE: lưu với ID tạm duy nhất ----------
             if (!navigator.onLine) {
                 const vOff = getNoteContentVersion();
+                let offlineId = nid;
+                if (!offlineId && currentTempId) {
+                    offlineId = currentTempId;
+                    document.getElementById('noteId').value = offlineId;
+                    currentNoteId = offlineId;
+                } else if (!offlineId && !currentTempId) {
+                    offlineId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                    currentTempId = offlineId;
+                    document.getElementById('noteId').value = offlineId;
+                    currentNoteId = offlineId;
+                }
                 const noteData = {
-                    id:         nid || 'temp_' + Date.now(),
-                    title:      tit,
-                    content:    cont,
-                    version:    Number.isFinite(vOff) ? vOff : 1,
+                    id: offlineId,
+                    title: tit,
+                    content: cont,
+                    version: Number.isFinite(vOff) ? vOff : 1,
                     updated_at: new Date().toISOString()
                 };
                 saveNoteOffline(noteData);
-                document.getElementById('saveStatus').innerHTML =
-                    '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Đã lưu offline</span>';
+                document.getElementById('saveStatus').innerHTML = '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Đã lưu offline</span>';
                 showToast('Không có mạng. Ghi chú đã lưu cục bộ.', 'warning');
                 return;
             }
 
+            // ---------- ONLINE ----------
             const verNum = getNoteContentVersion();
             if (nid && !Number.isFinite(verNum)) {
                 document.getElementById('saveStatus').innerText = '';
@@ -865,8 +914,8 @@ function autoSave() {
             const mySeq = ++autoSaveInFlightSeq;
 
             const fd = new FormData();
-            fd.append('id',      nid);
-            fd.append('title',   tit);
+            fd.append('id', nid);
+            fd.append('title', tit);
             fd.append('content', cont);
             fd.append('version', nid ? String(verNum) : '1');
             appendCsrfToken(fd);
@@ -876,7 +925,7 @@ function autoSave() {
                 .then(d => {
                     if (mySeq !== autoSaveInFlightSeq) return;
 
-                    const statusEl  = document.getElementById('saveStatus');
+                    const statusEl = document.getElementById('saveStatus');
                     const contentEl = document.getElementById('noteContent');
 
                     if (!d.success && d.conflict) {
@@ -905,7 +954,6 @@ function autoSave() {
                         return;
                     }
 
-                    // Lưu thành công -> reset retry counter
                     window._conflictRetryCount = 0;
 
                     if (d.success) {
@@ -915,11 +963,11 @@ function autoSave() {
                             document.getElementById('noteId').value = d.note_id;
                             currentNoteId = d.note_id;
                             setNoteOwnerToolbarVisible(true);
+                            // Chỉ xóa ID tạm khi đã đồng bộ thành công lên server
+                            currentTempId = null;
                         }
 
-                        if (d.version) {
-                            contentEl.dataset.version = d.version;
-                        }
+                        if (d.version) contentEl.dataset.version = d.version;
 
                         lastAutoSavePersistSig = _autoSavePayloadSignature();
                         scheduleLiveSearchAfterSave();
@@ -930,22 +978,30 @@ function autoSave() {
                 })
                 .catch(() => {
                     if (mySeq !== autoSaveInFlightSeq) return;
-                    document.getElementById('saveStatus').innerHTML =
-                        '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
+                    document.getElementById('saveStatus').innerHTML = '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
+                    let offlineId = nid;
+                    if (!offlineId && currentTempId) {
+                        offlineId = currentTempId;
+                        document.getElementById('noteId').value = offlineId;
+                        currentNoteId = offlineId;
+                    } else if (!offlineId && !currentTempId) {
+                        offlineId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+                        currentTempId = offlineId;
+                        document.getElementById('noteId').value = offlineId;
+                        currentNoteId = offlineId;
+                    }
                     const noteData = {
-                        id:         nid || 'temp_' + Date.now(),
-                        title:      tit,
-                        content:    cont,
-                        version:    Number.isFinite(getNoteContentVersion()) ? getNoteContentVersion() : 1,
+                        id: offlineId,
+                        title: tit,
+                        content: cont,
+                        version: Number.isFinite(getNoteContentVersion()) ? getNoteContentVersion() : 1,
                         updated_at: new Date().toISOString()
                     };
                     saveNoteOffline(noteData);
                     showToast('Không kết nối mạng. Ghi chú đã được lưu cục bộ.', 'warning');
                 })
                 .finally(() => {
-                    if (mySeq === autoSaveInFlightSeq) {
-                        isSaving = false;
-                    }
+                    if (mySeq === autoSaveInFlightSeq) isSaving = false;
                     if (mySeq !== autoSaveInFlightSeq) return;
                     setTimeout(() => {
                         if (isSaving || autoSaveTimer) return;
@@ -953,18 +1009,19 @@ function autoSave() {
                         if (noteVersionLoadPending) return;
                         if (noteConflictResolutionLock) return;
                         if (!navigator.onLine) return;
-                        if (_autoSavePayloadSignature() !== lastAutoSavePersistSig) {
-                            autoSave();
-                        }
+                        if (_autoSavePayloadSignature() !== lastAutoSavePersistSig) autoSave();
                     }, 0);
                 });
         };
         runCommitted();
     }, 1000);
 }
-
 // ====================== CHIA SẺ ======================
 function shareNote() {
+    if (!navigator.onLine) {
+        showAlert('Chức năng chia sẻ yêu cầu kết nối mạng.', 'warning');
+        return;
+    }
     const noteId = document.getElementById('noteId').value;
     const input  = document.getElementById('share_input').value.trim();
     const perm   = document.getElementById('sharePermission').value;
@@ -992,23 +1049,34 @@ function shareNote() {
 }
 
 function loadSharedUsers(noteId) {
+    if (!navigator.onLine) {
+        const list = document.getElementById('sharedUsersList');
+        list.innerHTML = '<li class="list-group-item">Không thể tải danh sách chia sẻ khi offline</li>';
+        return;
+    }
     fetch(`api/get_shares.php?note_id=${noteId}`)
         .then(r => r.json())
         .then(users => {
             const list = document.getElementById('sharedUsersList');
             list.innerHTML = '';
             users.forEach(u => {
-                list.innerHTML += `
-                    <li class="list-group-item d-flex justify-content-between align-items-center bg-transparent px-0 py-1">
-                        <span><i class="bi bi-person-check text-success"></i> ${escapeHtml(u.display_name)}
-                            <small>(${u.permission})</small></span>
-                        <button class="btn btn-sm btn-outline-danger py-0" onclick="revokeShare(${u.share_id})">Xóa</button>
-                    </li>`;
+                list.innerHTML += `<li class="list-group-item d-flex justify-content-between align-items-center bg-transparent px-0 py-1">
+                    <span><i class="bi bi-person-check text-success"></i> ${escapeHtml(u.display_name)} <small>(${u.permission})</small></span>
+                    <button class="btn btn-sm btn-outline-danger py-0" onclick="revokeShare(${u.share_id})">Xóa</button>
+                </li>`;
             });
+        })
+        .catch(() => {
+            const list = document.getElementById('sharedUsersList');
+            list.innerHTML = '<li class="list-group-item text-danger">Lỗi tải danh sách</li>';
         });
 }
 
 function revokeShare(shareId) {
+    if (!navigator.onLine) {
+        showAlert('Thu hồi chia sẻ yêu cầu kết nối mạng.', 'warning');
+        return;
+    }
     showConfirm('Thu hồi quyền chia sẻ này?', () => {
         const fd = new FormData();
         fd.append('share_id', shareId);
@@ -1025,10 +1093,12 @@ function revokeShare(shareId) {
 
 // ====================== KHÓA GHI CHÚ ======================
 function toggleLock() {
+    if (!navigator.onLine) {
+        showAlert('Chức năng khóa ghi chú yêu cầu kết nối mạng để xác thực.', 'warning');
+        return;
+    }
     const id = document.getElementById('noteId').value;
     if (!id) return;
-    // Kiểm tra xem note đã có mật khẩu chưa? Lấy từ dataset hoặc gọi API? 
-    // Hiện tại dùng biến isLockedState (được set khi mở note có password_hash)
     if (isLockedState) {
         _showLockActionPicker(id);
     } else {
@@ -1104,9 +1174,7 @@ function _showLockActionPicker(id) {
                         showError(d.message || 'Mật khẩu không đúng!');
                         return false;
                     }
-                    // Xác thực thành công
                     if (actionValue === 'unlock') {
-                        // Gửi yêu cầu mở khóa
                         const fdUnlock = new FormData();
                         fdUnlock.append('note_id',      id);
                         fdUnlock.append('old_password', oldPw);
@@ -1126,9 +1194,8 @@ function _showLockActionPicker(id) {
                                 }
                             });
                     } else if (actionValue === 'change') {
-                        // Chuyển modal hiện tại sang chế độ đổi mật khẩu (không đóng modal)
                         _switchToChangePasswordMode(id, oldPw);
-                        return false; // Không đóng modal tự động
+                        return false;
                     }
                     return false;
                 });
@@ -1136,65 +1203,17 @@ function _showLockActionPicker(id) {
     });
 }
 
-// function _showChangePasswordModal(id, oldPw) {
-//     // Kiểm tra oldPw có hợp lệ không
-//     if (!oldPw) {
-//         showToast('Lỗi: Không tìm thấy mật khẩu cũ!', 'danger');
-//         return;
-//     }
-//     _openPasswordModal({
-//         title: '🔑 Đặt mật khẩu mới',
-//         fields: [
-//             { id: 'pm_new_pw',     placeholder: 'Mật khẩu mới (≥ 4 ký tự)', type: 'password' },
-//             { id: 'pm_confirm_pw', placeholder: 'Nhập lại mật khẩu',         type: 'password' }
-//         ],
-//         onConfirm: (vals, showError) => {
-//             const [newPw, confirmPw] = vals;
-//             if (newPw.length < 4) {
-//                 showError('Mật khẩu phải có ít nhất 4 ký tự!');
-//                 return false;
-//             }
-//             if (newPw !== confirmPw) {
-//                 showError('Mật khẩu xác nhận không khớp!');
-//                 return false;
-//             }
-//             const fd = new FormData();
-//             fd.append('note_id',          id);
-//             fd.append('action',           'change');
-//             fd.append('old_password',     oldPw);  // Dùng oldPw từ tham số
-//             fd.append('password',         newPw);
-//             fd.append('confirm_password', confirmPw);
-//             appendCsrfToken(fd);
-//             return fetch('api/lock_note.php', { method: 'POST', body: fd })
-//                 .then(r => r.json())
-//                 .then(d => {
-//                     if (d.success) {
-//                         showToast('Đổi mật khẩu thành công!', 'success');
-//                         liveSearch();
-//                         return true;
-//                     } else {
-//                         showError(d.message || 'Không thể đổi mật khẩu!');
-//                         return false;
-//                     }
-//                 });
-//         }
-//     });
-// }
 function _switchToChangePasswordMode(id, oldPw) {
-    // Lấy các phần tử của modal hiện tại
     const titleEl = document.getElementById('passwordModalTitle');
     const bodyEl = document.getElementById('passwordModal').querySelector('.modal-body');
     const footerEl = document.getElementById('passwordModal').querySelector('.modal-footer');
     
-    // Thay đổi tiêu đề và nội dung modal thành giao diện đổi mật khẩu
     titleEl.textContent = '🔑 Đặt mật khẩu mới';
     bodyEl.innerHTML = `
         <input type="password" id="pm_new_pw" class="form-control mb-2" placeholder="Mật khẩu mới (≥ 4 ký tự)" autocomplete="off">
         <input type="password" id="pm_confirm_pw" class="form-control mb-2" placeholder="Nhập lại mật khẩu" autocomplete="off">
         <div id="pm_error" class="text-danger small mt-1" style="display:none;"></div>
     `;
-    
-    // Xóa các nút cũ và thêm nút xác nhận mới
     footerEl.innerHTML = `
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
         <button type="button" id="changePasswordConfirmBtn" class="btn btn-primary">Xác nhận</button>
@@ -1339,6 +1358,32 @@ function deleteNote(action) {
 }
 
 function _doDeleteNote(id, action) {
+    // Offline support
+    if (!navigator.onLine) {
+        queueOfflineAction(action === 'trash' ? 'delete' : 'permanent_delete', id);
+        // Cập nhật local IndexedDB
+        if (db) {
+            const tx = db.transaction(['notes'], 'readwrite');
+            const store = tx.objectStore('notes');
+            if (action === 'trash') {
+                const getReq = store.get(id);
+                getReq.onsuccess = () => {
+                    const note = getReq.result;
+                    if (note) {
+                        note.is_trashed = 1;
+                        note.is_pinned = 0;
+                        store.put(note);
+                    }
+                };
+            } else {
+                store.delete(id);
+            }
+        }
+        showToast('Đã lưu thao tác xóa (offline, sẽ đồng bộ sau)', 'success');
+        closeAndReload();
+        return;
+    }
+
     const fd = new FormData();
     fd.append('id',         id);
     fd.append('action',     action);
@@ -1420,6 +1465,24 @@ function _deleteNoteWithPassword(id, action) {
 
 function restoreNote() {
     const id = document.getElementById('noteId').value;
+    if (!navigator.onLine) {
+        queueOfflineAction('restore', id);
+        if (db) {
+            const tx = db.transaction(['notes'], 'readwrite');
+            const store = tx.objectStore('notes');
+            const getReq = store.get(id);
+            getReq.onsuccess = () => {
+                const note = getReq.result;
+                if (note) {
+                    note.is_trashed = 0;
+                    store.put(note);
+                }
+            };
+        }
+        showToast('Đã lưu thao tác khôi phục (offline, sẽ đồng bộ sau)', 'success');
+        closeAndReload();
+        return;
+    }
     const fd = new FormData();
     fd.append('id', id);
     appendCsrfToken(fd);
@@ -1520,7 +1583,6 @@ function connectWebSocket() {
             if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
         }
 
-        // ================== XỬ LÝ CẬP NHẬT NỘI DUNG (ĐÃ SỬA) ==================
         if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
             if (data.user_name === currentUserName) return;
 
@@ -1529,7 +1591,6 @@ function connectWebSocket() {
             const rawLocal = contentEl && contentEl.dataset.version;
             const localVer = rawLocal !== undefined && rawLocal !== '' ? parseInt(rawLocal, 10) : NaN;
 
-            // Chỉ cập nhật version nếu version mới lớn hơn version hiện tại (tránh ghi đè bằng version cũ)
             if (Number.isFinite(incomingVer) && (!Number.isFinite(localVer) || incomingVer > localVer)) {
                 contentEl.dataset.version = String(incomingVer);
             }
@@ -1564,7 +1625,6 @@ function connectWebSocket() {
             _showTypingIndicator(data.user_name);
         }
 
-        // ========== GIỮ NGUYÊN CÁC TYPE KHÁC ==========
         if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
             const modalWrapper = document.getElementById('modalContentWrapper');
             if (modalWrapper) {
@@ -1728,6 +1788,28 @@ function uploadImage() {
     const f = document.getElementById('imageInput').files[0];
     if (!f) return;
 
+    if (!navigator.onLine) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const base64 = e.target.result;
+            const tempId = 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+            // Lưu ảnh tạm vào store pending_images (sẽ đồng bộ sau)
+            if (db) {
+                const tx = db.transaction(['pending_images'], 'readwrite');
+                const store = tx.objectStore('pending_images');
+                store.put({ tempId, base64, noteId: nid, created_at: Date.now() });
+            }
+            // Hiển thị ảnh tạm thời
+            renderImage(base64, tempId, 'owner', true);
+            showToast('Ảnh đã lưu tạm, sẽ upload khi có mạng', 'info');
+            // Lưu action vào queue
+            queueOfflineAction('upload_image', nid, { tempId, base64 });
+        };
+        reader.readAsDataURL(f);
+        document.getElementById('imageInput').value = '';
+        return;
+    }
+
     const fd = new FormData();
     fd.append('image', f);
     fd.append('note_id', nid);
@@ -1739,13 +1821,7 @@ function uploadImage() {
             if (d.success) {
                 renderImage(d.file_path, d.image_id, 'owner');
                 if (wsReady && currentNoteIdForWS == nid) {
-                    _wsSend({
-                        type: 'image_added',
-                        note_id: nid,
-                        image_id: d.image_id,
-                        file_path: d.file_path,
-                        user_name: currentUserName
-                    });
+                    _wsSend({ type: 'image_added', note_id: nid, image_id: d.image_id, file_path: d.file_path, user_name: currentUserName });
                 }
             } else {
                 showAlert(d.message || 'Không thể upload ảnh', 'danger');
@@ -1755,7 +1831,7 @@ function uploadImage() {
         .catch(() => showAlert('Lỗi kết nối khi upload ảnh!', 'danger'));
 }
 
-function renderImage(path, id, perm) {
+function renderImage(path, id, perm, isBase64 = false) {
     const del = perm === 'owner'
         ? `<button class="btn btn-danger btn-sm position-absolute top-0 end-0 p-0 rounded-circle"
              style="width:24px;height:24px;margin:-8px -8px 0 0;"
@@ -1768,6 +1844,13 @@ function renderImage(path, id, perm) {
 }
 
 function deleteImage(id, btn) {
+    if (!navigator.onLine) {
+        queueOfflineAction('delete_image', currentNoteIdForWS, { image_id: id });
+        const imgDiv = btn.closest('[data-image-id]');
+        if (imgDiv) imgDiv.remove();
+        showToast('Đã lưu xóa ảnh (offline, sẽ đồng bộ sau)', 'success');
+        return;
+    }
     showConfirm('Xóa ảnh này?', () => {
         fetch('api/delete_image.php', {
             method: 'POST',
@@ -1778,12 +1861,7 @@ function deleteImage(id, btn) {
                 const imgDiv = btn.closest('[data-image-id]');
                 if (imgDiv) imgDiv.remove();
                 if (wsReady && currentNoteIdForWS) {
-                    _wsSend({
-                        type: 'image_deleted',
-                        note_id: currentNoteIdForWS,
-                        image_id: id,
-                        user_name: currentUserName
-                    });
+                    _wsSend({ type: 'image_deleted', note_id: currentNoteIdForWS, image_id: id, user_name: currentUserName });
                 }
             }
         });
@@ -1792,6 +1870,11 @@ function deleteImage(id, btn) {
 
 // ====================== LABEL ======================
 function loadFilterLabels(callback) {
+    if (!navigator.onLine) {
+        showToast('Không thể tải nhãn khi offline', 'warning');
+        if (callback) callback();
+        return;
+    }
     fetch('api/manage_labels.php?action=list')
         .then(r => r.json())
         .then(ls => {
@@ -1818,6 +1901,10 @@ function loadFilterLabels(callback) {
 function filterLabel(id) { currentLabelId = id; loadFilterLabels(() => liveSearch()); }
 
 function addNewLabel() {
+    if (!navigator.onLine) {
+        showAlert('Tạo nhãn yêu cầu kết nối mạng.', 'warning');
+        return;
+    }
     const name = document.getElementById('newLabelName').value.trim();
     if (!name) return;
     fetch('api/manage_labels.php?action=add', {
@@ -1840,7 +1927,6 @@ function renameLabel(id, currentName) {
     const modal = new bootstrap.Modal(modalEl);
     modal.show();
     
-    // Focus vào input sau khi modal hiển thị
     setTimeout(() => {
         if (inputEl) {
             inputEl.focus();
@@ -1848,7 +1934,6 @@ function renameLabel(id, currentName) {
         }
     }, 300);
     
-    // Gắn sự kiện cho nút xác nhận (loại bỏ listener cũ để tránh trùng lặp)
     const confirmBtn = document.getElementById('renameLabelConfirmBtn');
     const newConfirmBtn = confirmBtn.cloneNode(true);
     confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
@@ -1867,7 +1952,6 @@ function renameLabel(id, currentName) {
             return;
         }
         
-        // Gửi request đổi tên
         fetch('api/manage_labels.php?action=rename', {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1896,6 +1980,10 @@ function renameLabel(id, currentName) {
 }
 
 function deleteLabel(id) {
+    if (!navigator.onLine) {
+        showAlert('Xóa nhãn yêu cầu kết nối mạng.', 'warning');
+        return;
+    }
     showConfirm('Xóa nhãn này?', () => {
         fetch('api/manage_labels.php?action=delete', {
             method:  'POST',
@@ -1909,31 +1997,56 @@ function deleteLabel(id) {
 }
 
 function refreshLabelSelector() {
+    if (!navigator.onLine) {
+        const s = document.getElementById('labelSelector');
+        s.innerHTML = '<option value="">+ Nhãn (offline)</option>';
+        return;
+    }
     fetch('api/manage_labels.php?action=list')
         .then(r => r.json())
         .then(ls => {
             const s = document.getElementById('labelSelector');
             s.innerHTML = '<option value="">+ Nhãn</option>';
             ls.forEach(l => s.innerHTML += `<option value="${l.id}">${escapeHtml(l.name)}</option>`);
+        })
+        .catch(() => {
+            const s = document.getElementById('labelSelector');
+            s.innerHTML = '<option value="">+ Nhãn (lỗi)</option>';
         });
 }
 
 function loadLabelsForNote(nid) {
+    if (!navigator.onLine) {
+        document.getElementById('noteLabelsContainer').innerHTML = '<span class="text-muted">Không thể tải nhãn khi offline</span>';
+        return;
+    }
     fetch(`api/get_note_labels.php?note_id=${nid}`)
         .then(r => r.json())
         .then(ls => {
             const c = document.getElementById('noteLabelsContainer');
             c.innerHTML = '';
-            ls.forEach(l => c.innerHTML +=
-                `<span class="badge bg-secondary">${escapeHtml(l.name)}
-                 <i class="bi bi-x-circle-fill cp" onclick="removeLabel(${nid},${l.id})"></i></span>`);
+            ls.forEach(l => c.innerHTML += `<span class="badge bg-secondary">${escapeHtml(l.name)} <i class="bi bi-x-circle-fill cp" onclick="removeLabel(${nid},${l.id})"></i></span>`);
+        })
+        .catch(() => {
+            document.getElementById('noteLabelsContainer').innerHTML = '<span class="text-muted">Lỗi tải nhãn</span>';
         });
 }
-
 function addLabelToNote() {
     const nid = document.getElementById('noteId').value;
     const lid = document.getElementById('labelSelector').value;
     if (!lid) return;
+
+    if (!navigator.onLine) {
+        queueOfflineAction('add_label', nid, { label_id: lid });
+        // Cập nhật local (tạm thời thêm nhãn hiển thị)
+        const container = document.getElementById('noteLabelsContainer');
+        const labelName = document.getElementById('labelSelector').options[document.getElementById('labelSelector').selectedIndex]?.text || 'Nhãn';
+        container.innerHTML += `<span class="badge bg-secondary">${escapeHtml(labelName)} (offline)</span>`;
+        showToast('Đã lưu thêm nhãn (offline)', 'success');
+        liveSearch();
+        document.getElementById('labelSelector').value = '';
+        return;
+    }
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1946,6 +2059,21 @@ function addLabelToNote() {
 }
 
 function removeLabel(nid, lid) {
+    if (!navigator.onLine) {
+        queueOfflineAction('remove_label', nid, { label_id: lid });
+        // Xóa nhãn tạm thời khỏi UI
+        const container = document.getElementById('noteLabelsContainer');
+        const spans = container.querySelectorAll('span');
+        for (let span of spans) {
+            if (span.innerText.includes(escapeHtml(lid))) {
+                span.remove();
+                break;
+            }
+        }
+        showToast('Đã lưu xóa nhãn (offline)', 'success');
+        liveSearch();
+        return;
+    }
     fetch('api/set_note_label.php', {
         method:  'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -2101,6 +2229,29 @@ async function saveAccountSettings() {
     const newPwd = document.getElementById('newPassword').value;
     const confirmPwd = document.getElementById('confirmPassword').value;
     
+    // Offline support: lưu hành động vào queue
+    if (!navigator.onLine) {
+        if (newDisplayName && newDisplayName !== window.APP_CONFIG?.displayName) {
+            queueOfflineAction('update_display_name', null, { display_name: newDisplayName });
+            window.APP_CONFIG.displayName = newDisplayName;
+            document.querySelector('.navbar .small').innerText = `Chào, ${newDisplayName}!`;
+        }
+        if (oldPwd && newPwd) {
+            queueOfflineAction('change_password', null, { old_password: oldPwd, new_password: newPwd });
+        }
+        if (avatarFile) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                queueOfflineAction('update_avatar', null, { avatar_base64: e.target.result });
+                document.querySelector('.nav-avatar').src = e.target.result;
+            };
+            reader.readAsDataURL(avatarFile);
+        }
+        showToast('Đã lưu thay đổi profile (offline, sẽ đồng bộ sau)', 'success');
+        setTimeout(() => renderProfileScreen(), 500);
+        return;
+    }
+    
     // 1. Cập nhật tên hiển thị
     if (newDisplayName && newDisplayName !== window.APP_CONFIG?.displayName) {
         const fd = new FormData();
@@ -2170,6 +2321,21 @@ async function savePreferences() {
     const fontSize = document.getElementById('prefFontSize').value;
     const theme = document.getElementById('prefTheme').value;
     
+    // Offline support: lưu hành động vào queue
+    if (!navigator.onLine) {
+        queueOfflineAction('update_preferences', null, { note_color: noteColor, text_color: textColor, font_family: fontFamily, font_size: fontSize, theme_color: theme });
+        // Áp dụng ngay local
+        document.documentElement.style.setProperty('--note-default-color', noteColor);
+        document.documentElement.style.setProperty('--note-text-color', textColor);
+        document.body.style.fontFamily = fontFamily;
+        document.documentElement.style.fontSize = fontSize;
+        document.body.style.fontSize = fontSize;
+        applyTheme(theme);
+        showToast('Đã lưu tùy chỉnh (offline, sẽ đồng bộ sau)', 'success');
+        profileGoTo('main');
+        return;
+    }
+    
     const fd = new FormData();
     fd.append('note_color', noteColor);
     fd.append('text_color', textColor);
@@ -2182,30 +2348,21 @@ async function savePreferences() {
         const res = await fetch('api/update_preferences.php', { method: 'POST', body: fd });
         const data = await res.json();
         if (data.success) {
-            // Áp dụng màu nền mặc định
             document.documentElement.style.setProperty('--note-default-color', noteColor);
-            // Áp dụng màu chữ
             document.documentElement.style.setProperty('--note-text-color', textColor);
-            // Áp dụng font chữ
             document.body.style.fontFamily = fontFamily;
-            // Áp dụng cỡ chữ - set vào html để tránh bị CSS ghi đè
             document.documentElement.style.fontSize = fontSize;
-            document.body.style.fontSize = fontSize; // fallback
-            // Áp dụng theme
+            document.body.style.fontSize = fontSize;
             applyTheme(theme);
             
-            // Cập nhật tất cả các note card hiện có để đồng bộ giao diện
             document.querySelectorAll('.note-card').forEach(card => {
-                // Đảm bảo font-size được kế thừa từ html
                 card.style.fontSize = '';
-                // Cập nhật màu chữ nếu card chưa có màu nền riêng
                 const titleEl = card.querySelector('.card-title');
                 const textEl = card.querySelector('.card-text');
                 if (titleEl && !card.style.backgroundColor) titleEl.style.color = textColor;
                 if (textEl && !card.style.backgroundColor) textEl.style.color = textColor;
             });
             
-            // Cập nhật modal nếu đang mở
             const modalContent = document.getElementById('modalContentWrapper');
             if (modalContent && getComputedStyle(modalContent).backgroundColor !== 'rgba(0, 0, 0, 0)') {
                 modalContent.style.setProperty('--note-text-color', textColor);
@@ -2213,7 +2370,6 @@ async function savePreferences() {
                 modalTexts.forEach(el => el.style.color = textColor);
             }
             
-            // Cập nhật APP_CONFIG
             window.APP_CONFIG.noteColor = noteColor;
             window.APP_CONFIG.textColor = textColor;
             window.APP_CONFIG.fontFamily = fontFamily;
@@ -2236,7 +2392,6 @@ function showForgotPasswordModal() {
         showToast('Không tìm thấy email của bạn', 'danger');
         return;
     }
-    // Chuyển hướng đến trang reset_password.php với email được điền sẵn
     window.location.href = `reset_password.php?email=${encodeURIComponent(email)}`;
 }
 
@@ -2263,6 +2418,48 @@ function applyTheme(theme) {
     localStorage.setItem('noteapp_theme', theme);
 }
 
+// ====================== OFFLINE ACTIONS QUEUE ======================
+// Đảm bảo các store offline_actions và pending_images tồn tại
+async function getOfflineActionsDb() {
+    if (offlineActionsDb) return offlineActionsDb;
+    return new Promise((resolve) => {
+        const req = indexedDB.open('NoteAppDB', 5);
+        req.onupgradeneeded = (event) => {
+            const dbUp = event.target.result;
+            if (!dbUp.objectStoreNames.contains('offline_actions')) {
+                dbUp.createObjectStore('offline_actions', { autoIncrement: true });
+            }
+            if (!dbUp.objectStoreNames.contains('pending_images')) {
+                dbUp.createObjectStore('pending_images', { keyPath: 'tempId' });
+            }
+        };
+        req.onsuccess = () => {
+            offlineActionsDb = req.result;
+            resolve(offlineActionsDb);
+        };
+        req.onerror = () => {
+            console.error('Failed to open offline_actions DB');
+            resolve(null);
+        };
+    });
+}
+
+async function queueOfflineAction(type, note_id, data = {}) {
+    const actionDb = await getOfflineActionsDb();
+    if (!actionDb) {
+        console.warn('Offline actions DB not available, skipping queue');
+        return false;
+    }
+    try {
+        const tx = actionDb.transaction('offline_actions', 'readwrite');
+        const store = tx.objectStore('offline_actions');
+        store.add({ type, note_id, data, created_at: Date.now(), synced: false });
+        return true;
+    } catch (e) {
+        console.error('queueOfflineAction error:', e);
+        return false;
+    }
+}
 // ====================== TIỆN ÍCH ======================
 function setView(v) {
     document.getElementById('notesContainer').className =
@@ -2270,6 +2467,25 @@ function setView(v) {
 }
 
 function togglePin(id, state) {
+    if (!navigator.onLine) {
+        queueOfflineAction('pin', id, { is_pinned: state });
+        if (db) {
+            const tx = db.transaction(['notes'], 'readwrite');
+            const store = tx.objectStore('notes');
+            const getReq = store.get(id);
+            getReq.onsuccess = () => {
+                const note = getReq.result;
+                if (note) {
+                    note.is_pinned = state ? 1 : 0;
+                    note.pinned_at = state ? new Date().toISOString() : null;
+                    store.put(note);
+                }
+            };
+        }
+        showToast(`Đã ${state ? 'ghim' : 'bỏ ghim'} (offline)`, 'success');
+        liveSearch();
+        return;
+    }
     const fd = new FormData();
     fd.append('id', id);
     fd.append('is_pinned', state);
@@ -2285,11 +2501,6 @@ function changeColor(color) {
         return;
     }
 
-    const fd = new FormData();
-    fd.append('id', id);
-    fd.append('color', color || '');
-    appendCsrfToken(fd);
-
     const modalWrapper = document.getElementById('modalContentWrapper');
     if (modalWrapper) {
         modalWrapper.style.backgroundColor = color || '';
@@ -2297,11 +2508,29 @@ function changeColor(color) {
     }
 
     if (!navigator.onLine) {
-        queueAction('api/change_color.php', fd);
-        showToast('Đã lưu thay đổi màu (offline)', 'success');
+        queueOfflineAction('color', id, { color: color || '' });
+        if (db) {
+            const tx = db.transaction(['notes'], 'readwrite');
+            const store = tx.objectStore('notes');
+            const getReq = store.get(id);
+            getReq.onsuccess = () => {
+                const note = getReq.result;
+                if (note) {
+                    note.color = color || '';
+                    note.updated_at = new Date().toISOString();
+                    store.put(note);
+                }
+            };
+        }
+        showToast('Đã lưu thay đổi màu (offline, sẽ đồng bộ sau)', 'success');
         liveSearch();
         return;
     }
+
+    const fd = new FormData();
+    fd.append('id', id);
+    fd.append('color', color || '');
+    appendCsrfToken(fd);
 
     fetch('api/change_color.php', { method: 'POST', body: fd })
         .then(res => res.json())
@@ -2309,12 +2538,7 @@ function changeColor(color) {
             if (d.success) {
                 showToast('Đã đổi màu ghi chú thành công', 'success');
                 if (wsReady && currentNoteIdForWS == id) {
-                    _wsSend({
-                        type: 'color_update',
-                        note_id: id,
-                        color: color || '',
-                        user_name: currentUserName
-                    });
+                    _wsSend({ type: 'color_update', note_id: id, color: color || '', user_name: currentUserName });
                 }
                 liveSearch();
             } else {
@@ -2420,7 +2644,7 @@ function showConfirm(message, onConfirm, onCancel = null) {
 let db = null;
 
 function initIndexedDB() {
-    const request = indexedDB.open('NoteAppDB', 3);
+    const request = indexedDB.open('NoteAppDB', 5); // version 5
 
     request.onupgradeneeded = function (event) {
         db = event.target.result;
@@ -2429,11 +2653,18 @@ function initIndexedDB() {
             store.createIndex('updated_at', 'updated_at');
             store.createIndex('isTemp',     'isTemp');
         }
+        if (!db.objectStoreNames.contains('offline_actions')) {
+            db.createObjectStore('offline_actions', { autoIncrement: true });
+        }
+        if (!db.objectStoreNames.contains('pending_images')) {
+            db.createObjectStore('pending_images', { keyPath: 'tempId' });
+        }
     };
 
     request.onsuccess = function (event) {
         db = event.target.result;
-        console.log('[IndexedDB] Initialized v3');
+        console.log('[IndexedDB] Initialized v5');
+        getOfflineActionsDb(); // khởi tạo biến offlineActionsDb
         scheduleOfflineSyncStateEvent();
         if (navigator.onLine) {
             setTimeout(syncOfflineNotes, 2000);
@@ -2451,17 +2682,25 @@ function isNoteTemp(id) {
 
 function saveNoteOffline(note) {
     if (!db) return;
-    const noteToSave = {
-        ...note,
-        isTemp:        isNoteTemp(note.id),
-        syncStatus:    'pending',
-        updated_at:    new Date().toISOString(),
-        retryCount:    0,
-        nextRetryAt:   undefined,
-        lastSyncError: undefined
+    const cleanNote = {
+        id: note.id,
+        title: note.title || '',
+        content: note.content || '',
+        version: note.version || 1,
+        updated_at: note.updated_at || new Date().toISOString(),
+        isTemp: isNoteTemp(note.id),
+        syncStatus: 'pending',
+        retryCount: 0,
+        nextRetryAt: undefined,
+        lastSyncError: undefined,
+        is_locked: 0,
+        owner_name: '',
+        is_pinned: 0,
+        color: note.color || '',
+        permission: 'owner'
     };
     const tx = db.transaction(['notes'], 'readwrite');
-    tx.objectStore('notes').put(noteToSave);
+    tx.objectStore('notes').put(cleanNote);
     console.log(`[Offline] Saved note ${note.id}`);
     scheduleOfflineSyncStateEvent();
 }
@@ -2563,126 +2802,243 @@ async function getAllOfflineNotes() {
 async function syncOfflineNotes() {
     if (!navigator.onLine || !db) return;
 
+    // ---- Bước 1: Đồng bộ nội dung ghi chú (tạo mới / cập nhật) trước ----
     const offlineNotes = await getAllOfflineNotes();
-    if (offlineNotes.length === 0) return;
+    const tempToRealMap = new Map(); // lưu ánh xạ từ temp_id -> real_id
 
-    const now        = Date.now();
-    const toProcess  = offlineNotes.filter((n) => !n.nextRetryAt || n.nextRetryAt <= now);
-    if (toProcess.length === 0) {
-        scheduleOfflineSyncStateEvent();
-        scheduleOfflineSyncRetrySweep();
-        return;
-    }
+    // Lọc các note cần đồng bộ (bỏ qua các note đang chờ retry)
+    const now = Date.now();
+    const notesToSync = offlineNotes.filter(n => !n.nextRetryAt || n.nextRetryAt <= now);
 
-    console.log(`[Offline Sync] Found ${offlineNotes.length} notes (${toProcess.length} due now)`);
-    offlineSyncIsRunning = true;
-    emitOfflineSyncStateEvent();
-
-    let syncedCount              = 0;
-    let conflictStillPending    = 0;
-
-    for (const note of toProcess) {
-        let work               = { ...note };
-        let unresolvedConflict = false;
+    for (const note of notesToSync) {
+        let work = { ...note };
+        let success = false;
+        let realId = null;
 
         for (let attempt = 0; attempt < 4; attempt++) {
             try {
                 const fd = new FormData();
-                fd.append('id',         isNoteTemp(work.id) ? 0 : work.id);
-                fd.append('title',      work.title   || '');
-                fd.append('content',    work.content || '');
-                fd.append('version',    String(work.version != null && work.version !== '' ? work.version : 1));
+                fd.append('id', isNoteTemp(work.id) ? 0 : work.id);
+                fd.append('title', work.title || '');
+                fd.append('content', work.content || '');
+                fd.append('version', String(work.version != null ? work.version : 1));
                 appendCsrfToken(fd);
 
                 const res = await fetch('api/save_note.php', { method: 'POST', body: fd });
-
-                let data;
-                try {
-                    data = await res.json();
-                } catch (parseErr) {
-                    console.error('Sync failed for note', work.id, parseErr);
-                    unresolvedConflict = false;
-                    await bumpOfflineRetry(work, 'Phản hồi máy chủ không hợp lệ');
-                    break;
-                }
+                const data = await res.json();
 
                 if (!res.ok) {
-                    unresolvedConflict = false;
                     await bumpOfflineRetry(work, `Lỗi HTTP ${res.status}`);
                     break;
                 }
 
                 if (data.success) {
-                    unresolvedConflict = false;
-                    syncedCount++;
+                    success = true;
+                    realId = data.note_id;
+                    // Xóa note tạm khỏi IndexedDB
                     const delTx = db.transaction(['notes'], 'readwrite');
                     delTx.objectStore('notes').delete(work.id);
-                    console.log(`[Offline] Synced ${work.id} → ${data.note_id}`);
+                    console.log(`[Offline] Synced ${work.id} → ${realId}`);
                     break;
                 }
 
                 if (data.conflict) {
-                    unresolvedConflict = true;
+                    // Xung đột: cập nhật version và thử lại
                     const serverVer = parseInt(data.version, 10);
                     work = {
                         ...work,
-                        title:         work.title,
-                        content:       work.content,
-                        version:       Number.isFinite(serverVer) ? serverVer : (work.version || 1),
-                        syncStatus:    'pending',
-                        retryCount:    0,
-                        nextRetryAt:   undefined,
-                        lastSyncError: undefined,
-                        updated_at:    work.updated_at
+                        version: Number.isFinite(serverVer) ? serverVer : (work.version || 1),
+                        syncStatus: 'pending',
+                        retryCount: 0,
+                        nextRetryAt: undefined,
+                        lastSyncError: undefined
                     };
                     putOfflineNote(work);
                     continue;
                 }
 
-                unresolvedConflict = false;
+                // Lỗi khác
                 await bumpOfflineRetry(work, data.message || 'Đồng bộ thất bại');
                 break;
             } catch (err) {
-                console.error('Sync failed for note', work.id, err);
-                unresolvedConflict = false;
-                await bumpOfflineRetry(work, (err && err.message) || 'Lỗi mạng');
+                console.error('Sync note error', work.id, err);
+                await bumpOfflineRetry(work, err.message || 'Lỗi mạng');
                 break;
             }
         }
-
-        if (unresolvedConflict) {
-            conflictStillPending++;
-            await bumpOfflineRetry(work, 'Xung đột phiên bản lặp lại; giữ bản cục bộ và chờ thử lại');
+        if (success && realId && isNoteTemp(note.id)) {
+            tempToRealMap.set(note.id, realId);
         }
     }
 
-    offlineSyncIsRunning = false;
-    emitOfflineSyncStateEvent();
-    scheduleOfflineSyncRetrySweep();
+    // ---- Bước 2: Đồng bộ ảnh chờ upload (dùng note_id thật nếu có ánh xạ) ----
+    if (db.objectStoreNames.contains('pending_images')) {
+        const tx = db.transaction('pending_images', 'readonly');
+        const store = tx.objectStore('pending_images');
+        const pendingImages = await new Promise((resolve) => {
+            const req = store.getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => resolve([]);
+        });
+        for (const img of pendingImages) {
+            let realNoteId = img.noteId;
+            if (tempToRealMap.has(img.noteId)) {
+                realNoteId = tempToRealMap.get(img.noteId);
+            }
+            try {
+                const blob = await (await fetch(img.base64)).blob();
+                const fd = new FormData();
+                fd.append('note_id', realNoteId);
+                fd.append('image', blob, 'offline_image.jpg');
+                appendCsrfToken(fd);
+                const res = await fetch('api/upload_image.php', { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.success) {
+                    const delTx = db.transaction('pending_images', 'readwrite');
+                    delTx.objectStore('pending_images').delete(img.tempId);
+                }
+            } catch (e) { console.error('Sync image failed', e); }
+        }
+    }
 
-    if (syncedCount > 0) {
-        showToast(`Đã đồng bộ ${syncedCount} ghi chú từ chế độ offline`, 'success');
-        setTimeout(liveSearch, 800);
+    // ---- Bước 3: Đồng bộ các action khác (dùng note_id thật đã ánh xạ) ----
+    const actions = await new Promise((resolve) => {
+        if (!offlineActionsDb) return resolve([]);
+        const tx = offlineActionsDb.transaction('offline_actions', 'readonly');
+        const store = tx.objectStore('offline_actions');
+        const items = [];
+        const request = store.openCursor();
+        request.onsuccess = (event) => {
+            const cursor = event.target.result;
+            if (cursor) {
+                items.push({ key: cursor.key, value: cursor.value });
+                cursor.continue();
+            } else {
+                resolve(items);
+            }
+        };
+        request.onerror = () => resolve([]);
+    });
+
+    for (const { key, value: action } of actions) {
+        // Bỏ qua action upload_image (đã xử lý ở bước 2)
+        if (action.type === 'upload_image') continue;
+
+        // Ánh xạ note_id nếu có
+        let targetNoteId = action.note_id;
+        if (tempToRealMap.has(targetNoteId)) {
+            targetNoteId = tempToRealMap.get(targetNoteId);
+        } else if (isNoteTemp(targetNoteId) && !tempToRealMap.has(targetNoteId)) {
+            // Nếu note_id là tạm nhưng không có trong map (có thể đã bị xóa), bỏ qua action
+            console.warn(`Skip action ${action.type} for non-existent temp note ${targetNoteId}`);
+            continue;
+        }
+
+        try {
+            const fd = new FormData();
+            appendCsrfToken(fd);
+            let url = '';
+            let success = false;
+
+            switch (action.type) {
+                case 'color':
+                    fd.append('id', targetNoteId);
+                    fd.append('color', action.data.color);
+                    url = 'api/change_color.php';
+                    break;
+                case 'pin':
+                    fd.append('id', targetNoteId);
+                    fd.append('is_pinned', action.data.is_pinned);
+                    url = 'api/pin_note.php';
+                    break;
+                case 'delete':
+                    fd.append('id', targetNoteId);
+                    fd.append('action', 'trash');
+                    url = 'api/delete_note.php';
+                    break;
+                case 'permanent_delete':
+                    fd.append('id', targetNoteId);
+                    fd.append('action', 'permanent');
+                    url = 'api/delete_note.php';
+                    break;
+                case 'restore':
+                    fd.append('id', targetNoteId);
+                    url = 'api/restore_note.php';
+                    break;
+                case 'add_label':
+                    fd.append('note_id', targetNoteId);
+                    fd.append('label_id', action.data.label_id);
+                    fd.append('action', 'add');
+                    url = 'api/set_note_label.php';
+                    break;
+                case 'remove_label':
+                    fd.append('note_id', targetNoteId);
+                    fd.append('label_id', action.data.label_id);
+                    fd.append('action', 'remove');
+                    url = 'api/set_note_label.php';
+                    break;
+                case 'delete_image':
+                    fd.append('id', action.data.image_id);
+                    url = 'api/delete_image.php';
+                    break;
+                case 'update_display_name':
+                    fd.append('display_name', action.data.display_name);
+                    url = 'api/update_display_name.php';
+                    break;
+                case 'change_password':
+                    fd.append('old_password', action.data.old_password);
+                    fd.append('new_password', action.data.new_password);
+                    url = 'api/change_password.php';
+                    break;
+                case 'update_avatar':
+                    const blob = await (await fetch(action.data.avatar_base64)).blob();
+                    fd.append('avatar', blob);
+                    url = 'api/update_avatar.php';
+                    break;
+                case 'update_preferences':
+                    fd.append('note_color', action.data.note_color);
+                    fd.append('text_color', action.data.text_color);
+                    fd.append('font_family', action.data.font_family);
+                    fd.append('font_size', action.data.font_size);
+                    fd.append('theme_color', action.data.theme_color);
+                    url = 'api/update_preferences.php';
+                    break;
+                default:
+                    continue;
+            }
+
+            if (url) {
+                const res = await fetch(url, { method: 'POST', body: fd });
+                const data = await res.json();
+                if (data.success) success = true;
+                else console.warn(`Action ${action.type} failed:`, data.message);
+            }
+
+            if (success) {
+                const delTx = offlineActionsDb.transaction('offline_actions', 'readwrite');
+                delTx.objectStore('offline_actions').delete(key);
+            }
+        } catch (e) {
+            console.error('Sync action error', action.type, e);
+        }
     }
-    if (conflictStillPending > 0) {
-        showToast(
-            conflictStillPending === 1
-                ? 'Một ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.'
-                : `${conflictStillPending} ghi chú offline vẫn xung đột phiên bản sau vài lần thử; giữ bản cục bộ và sẽ thử lại sau.`,
-            'warning'
-        );
-    }
+
+    // ---- Bước 4: Đồng bộ lại lần cuối các note có thể còn (phòng trường hợp conflict) ----
+    // (có thể bỏ qua nếu không cần)
+    scheduleOfflineSyncRetrySweep();
+    emitOfflineSyncStateEvent();
 }
 
 async function loadNotesOfflineFallback() {
     const offlineNotes = await getAllOfflineNotes();
-    if (offlineNotes.length > 0) {
-        offlineNotes.forEach(n => {
-            if (isNoteTemp(n.id)) n.title = '📴 ' + (n.title || 'Ghi chú tạm');
-        });
-        renderNotes(offlineNotes);
-        showToast('Đang hiển thị ghi chú offline', 'warning');
-        return true;
+    const pendingNotes = offlineNotes.filter(n => n.syncStatus === 'pending' || isNoteTemp(n.id));
+    
+    if (pendingNotes.length === 0) {
+        renderNotes([]);
+        return false;
     }
-    return false;
+    
+    renderNotes(pendingNotes);
+    showToast(`Đang hiển thị ${pendingNotes.length} ghi chú offline`, 'warning');
+    return true;
 }

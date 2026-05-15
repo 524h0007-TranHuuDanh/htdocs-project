@@ -3,7 +3,7 @@
     <div class="modal-dialog modal-dialog-centered modal-lg">
         <div class="modal-content shadow-lg" id="modalContentWrapper">
             <div class="modal-header border-0 pb-0">
-                <input type="text" id="noteTitle" class="form-control border-0 fs-3 fw-bold bg-transparent" placeholder="Tiêu đề..." oninput="autoSave()">
+                <input type="text" id="noteTitle" class="form-control border-0 fs-3 fw-bold bg-transparent" placeholder="Tiêu đề...">
                 <span id="wsStatusBadge" class="badge bg-secondary ms-2 small" style="display:none;"></span>
                 <button type="button" class="btn-close" onclick="closeAndReload()"></button>
             </div>
@@ -13,7 +13,7 @@
                 <div id="wsTypingIndicator" class="text-muted small fst-italic mb-2" style="display:none;"></div>
 
                 <input type="hidden" id="noteId" value="">
-                <textarea id="noteContent" class="form-control border-0 bg-transparent mb-3" rows="10" placeholder="Bạn đang nghĩ gì?..." oninput="autoSave()"></textarea>
+                <textarea id="noteContent" class="form-control border-0 bg-transparent mb-3" rows="10" placeholder="Bạn đang nghĩ gì?..."></textarea>
                 <div id="imagePreviewContainer" class="d-flex flex-wrap gap-2 mb-3"></div>
 
                 <!-- Color -->
@@ -86,6 +86,7 @@
     </div>
 </div>
 
+<!-- Các modal khác giữ nguyên... (các modal profile, password, delete, custom, bulk, reset, rename) -->
 <!-- Modal Profile MỚI (thay thế hoàn toàn) -->
 <div class="modal fade" id="profileModal" tabindex="-1" data-bs-backdrop="static">
     <div class="modal-dialog modal-dialog-centered modal-md">
