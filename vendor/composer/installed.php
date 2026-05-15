@@ -1,24 +1,15 @@
 <?php return array(
     'root' => array(
-        'name' => '__root__',
+        'name' => 'noteapp/pro',
         'pretty_version' => 'dev-main',
         'version' => 'dev-main',
-        'reference' => 'd9f43274cf06858dd39a607bf57cf1e25038258c',
+        'reference' => 'd2a4ebc9321c0c3c16fc297e1482a20242f2cd02',
         'type' => 'library',
         'install_path' => __DIR__ . '/../../',
         'aliases' => array(),
         'dev' => true,
     ),
     'versions' => array(
-        '__root__' => array(
-            'pretty_version' => 'dev-main',
-            'version' => 'dev-main',
-            'reference' => 'd9f43274cf06858dd39a607bf57cf1e25038258c',
-            'type' => 'library',
-            'install_path' => __DIR__ . '/../../',
-            'aliases' => array(),
-            'dev_requirement' => false,
-        ),
         'cboden/ratchet' => array(
             'pretty_version' => 'v0.4.4',
             'version' => '0.4.4.0',
@@ -43,6 +34,15 @@
             'reference' => '7d0ed42f28e42d61352a7a79de682e5e67fec884',
             'type' => 'library',
             'install_path' => __DIR__ . '/../guzzlehttp/psr7',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+        'noteapp/pro' => array(
+            'pretty_version' => 'dev-main',
+            'version' => 'dev-main',
+            'reference' => 'd2a4ebc9321c0c3c16fc297e1482a20242f2cd02',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../../',
             'aliases' => array(),
             'dev_requirement' => false,
         ),

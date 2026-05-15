@@ -1,9 +1,8 @@
 <?php
-// Cấu hình Database
-$host = 'localhost';
-$db   = 'note_management';
-$user = 'root'; // Thay đổi theo máy của bạn (thường là root trên XAMPP)
-$pass = '';     // Thay đổi theo máy của bạn (thường để trống trên XAMPP)
+$host = getenv('DB_HOST') ?: 'db';
+$db   = getenv('DB_NAME') ?: 'note_management';
+$user = getenv('DB_USER') ?: 'root';
+$pass = getenv('DB_PASSWORD') ?: 'root';
 $charset = 'utf8mb4';
 
 $dsn = "mysql:host=$host;dbname=$db;charset=utf8mb4";
@@ -14,9 +13,9 @@ $options = [
 ];
 
 try {
-     $pdo = new PDO($dsn, $user, $pass, $options);
+    $pdo = new PDO($dsn, $user, $pass, $options);
 } catch (\PDOException $e) {
-     // Lưu ý: Trong môi trường production không nên hiển thị lỗi chi tiết thế này
-     throw new \PDOException($e->getMessage(), (int)$e->getCode());
+    error_log("Database connection failed: " . $e->getMessage());
+    throw new \PDOException($e->getMessage(), (int)$e->getCode());
 }
 ?>
