@@ -207,3 +207,52 @@
         </div>
     </div>
 </div>
+<!-- Modal chọn phương thức reset mật khẩu (dùng trong profile) -->
+<div class="modal fade" id="resetChoiceModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold text-primary">Khôi phục mật khẩu</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-center py-4">
+                <p class="mb-4">Chọn phương thức nhận mã khôi phục mật khẩu:</p>
+                <div class="d-grid gap-3">
+                    <button id="resetChoiceOtpBtn" class="btn btn-outline-primary btn-lg py-3">
+                        <i class="bi bi-envelope-paper fs-4 me-2"></i> Gửi mã OTP
+                    </button>
+                    <button id="resetChoiceLinkBtn" class="btn btn-outline-success btn-lg py-3">
+                        <i class="bi bi-link-45deg fs-4 me-2"></i> Gửi link đặt lại mật khẩu
+                    </button>
+                </div>
+            </div>
+            <div class="modal-footer border-0 justify-content-center">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Modal Đổi tên nhãn -->
+<div class="modal fade" id="renameLabelModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow-lg">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold">
+                    <i class="bi bi-pencil-square"></i> Đổi tên nhãn
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Tên nhãn mới</label>
+                    <input type="text" id="renameLabelInput" class="form-control" placeholder="Nhập tên nhãn..." autocomplete="off">
+                    <div id="renameLabelError" class="text-danger small mt-1" style="display:none;"></div>
+                </div>
+            </div>
+            <div class="modal-footer border-0">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+                <button type="button" id="renameLabelConfirmBtn" class="btn btn-primary">Lưu</button>
+            </div>
+        </div>
+    </div>
+</div>

@@ -1391,15 +1391,17 @@ if (!$user) {
 
 $reset_token = bin2hex(random_bytes(32));
 $expiry = date('Y-m-d H:i:s', strtotime('+15 minutes'));
-$pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
-    ->execute([$reset_token, $expiry, $user_id]);
 
 if ($type === 'link') {
+    $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
+        ->execute([$reset_token, $expiry, $user_id]);
     $sent = sendResetLinkEmail($user['email'], $user['display_name'], $reset_token);
     $msg = 'Link đặt lại mật khẩu đã được gửi';
 } else {
     $otp = rand(100000, 999999);
-    $pdo->prepare("UPDATE users SET reset_token = ? WHERE id = ?")->execute([$otp, $user_id]);
+    // SỬA: thêm reset_token_expiry cho OTP (giống link)
+    $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
+        ->execute([$otp, $expiry, $user_id]);
     $sent = sendResetOTPEmail($user['email'], $user['display_name'], $otp);
     $msg = 'Mã OTP đã được gửi';
 }
@@ -2692,49 +2694,6 @@ body::after {
 }
 
 /* =========================================================
-   BULK TOOLBAR (fixed bottom)
-   ========================================================= */
-#bulkToolbar {
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 1060;
-    background: rgba(255,255,255,0.28);
-    backdrop-filter: blur(32px) saturate(200%);
-    border-radius: 60px;
-    padding: 8px 16px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 1px 0 rgba(255,255,255,0.4) inset;
-    border: 1px solid rgba(255,255,255,0.4);
-    transition: all 0.3s var(--ease-spring);
-}
-#bulkToolbar .btn {
-    border-radius: 40px !important;
-    padding: 6px 16px;
-    font-weight: 500;
-}
-#bulkToolbar .btn-danger {
-    background: linear-gradient(135deg, #ff6b6b, #ee5a52);
-    border: none;
-}
-#bulkToolbar .btn-success {
-    background: linear-gradient(135deg, #20bf6b, #05c46b);
-}
-#bulkToolbar .btn-dark {
-    background: linear-gradient(135deg, #2d3436, #1e272e);
-}
-#bulkToolbar .btn-info {
-    background: linear-gradient(135deg, #4facfe, #00f2fe);
-}
-#bulkCounter {
-    background: rgba(0,0,0,0.3);
-    backdrop-filter: blur(4px);
-    border-radius: 40px;
-    padding: 2px 12px;
-    margin-left: 8px;
-}
-
-/* =========================================================
    CARD BODY
    ========================================================= */
 .card-body {
@@ -3020,15 +2979,16 @@ label { color: var(--text-on-glass-light) !important; }
    COLOR BUTTON
    ========================================================= */
 .color-btn {
-    width: 28px; height: 28px;
+    display: inline-block;      /* Quan trọng: giúp width/height có hiệu lực */
+    width: 28px;
+    height: 28px;
     border-radius: 50%;
     border: 2px solid rgba(255,255,255,0.75);
     cursor: pointer;
-    transition:
-        transform 0.3s var(--ease-spring),
-        box-shadow 0.28s var(--ease-smooth),
-        border-color 0.25s;
+    transition: transform 0.3s var(--ease-spring), box-shadow 0.28s var(--ease-smooth), border-color 0.25s;
     box-shadow: 0 3px 10px -2px rgba(15,23,42,0.14);
+    margin-right: 6px;          /* Tạo khoảng cách giữa các nút */
+    vertical-align: middle;     /* Căn giữa với text bên cạnh */
 }
 .color-btn:hover {
     transform: scale(1.20) rotate(10deg);
@@ -3671,13 +3631,136 @@ body[data-bs-theme="dark"] .note-card[style*="background-color"] .card-text {
     color: #0A1024 !important;
 }
 
+
 /* =========================================================
-   BULK MODE TOGGLE BUTTON ACTIVE STATE
+   DARK MODE - CÁC PHẦN CHIA SẺ, PRESENCE, TYPING GIỐNG LIGHT
    ========================================================= */
-#toggleBulkModeBtn.active {
-    background-color: var(--primary) !important;
-    color: white !important;
-    border-color: var(--primary) !important;
+body[data-bs-theme="dark"] #shareManagerSection,
+[data-bs-theme="dark"] #shareManagerSection,
+body[data-bs-theme="dark"] #wsPresenceBar,
+[data-bs-theme="dark"] #wsPresenceBar,
+body[data-bs-theme="dark"] #wsTypingIndicator,
+[data-bs-theme="dark"] #wsTypingIndicator {
+    background-color: #f8f9fa !important;      /* nền sáng như light mode */
+    color: #212529 !important;                 /* chữ tối như light mode */
+    border-color: #dee2e6 !important;          /* viền xám nhạt */
+}
+
+/* Đảm bảo các thành phần con cũng sáng */
+body[data-bs-theme="dark"] #shareManagerSection .form-control,
+body[data-bs-theme="dark"] #shareManagerSection .form-select,
+body[data-bs-theme="dark"] #shareManagerSection .btn,
+body[data-bs-theme="dark"] #shareManagerSection .list-group-item,
+body[data-bs-theme="dark"] #shareManagerSection small,
+body[data-bs-theme="dark"] #shareManagerSection h6,
+[data-bs-theme="dark"] #shareManagerSection .form-control,
+[data-bs-theme="dark"] #shareManagerSection .form-select,
+[data-bs-theme="dark"] #shareManagerSection .btn,
+[data-bs-theme="dark"] #shareManagerSection .list-group-item,
+[data-bs-theme="dark"] #shareManagerSection small,
+[data-bs-theme="dark"] #shareManagerSection h6 {
+    background-color: #ffffff !important;      /* input nền trắng */
+    color: #212529 !important;                /* chữ đen */
+    border-color: #ced4da !important;
+}
+
+/* Riêng wsPresenceBar và wsTypingIndicator giữ kiểu alert nhưng nền sáng */
+body[data-bs-theme="dark"] #wsPresenceBar,
+[data-bs-theme="dark"] #wsPresenceBar {
+    background-color: #d1e7dd !important;     /* xanh nhạt như alert-success light */
+    color: #0f5132 !important;                /* chữ xanh đậm */
+    border-color: #badbcc !important;
+}
+
+body[data-bs-theme="dark"] #wsTypingIndicator,
+[data-bs-theme="dark"] #wsTypingIndicator {
+    background-color: #fff3cd !important;     /* vàng nhạt như alert-warning light */
+    color: #997404 !important;                /* chữ vàng đậm */
+    border-color: #ffecb5 !important;
+}
+
+/* Nút xóa trong danh sách shared users */
+body[data-bs-theme="dark"] #sharedUsersList .btn-outline-danger,
+[data-bs-theme="dark"] #sharedUsersList .btn-outline-danger {
+    color: #dc3545 !important;
+    border-color: #dc3545 !important;
+    background-color: transparent !important;
+}
+
+body[data-bs-theme="dark"] #sharedUsersList .btn-outline-danger:hover,
+[data-bs-theme="dark"] #sharedUsersList .btn-outline-danger:hover {
+    background-color: #dc3545 !important;
+    color: #ffffff !important;
+}
+
+/* =========================================================
+   BULK MODE ANIMATIONS – CHECKBOX & TOOLBAR (CĂN GIỮA) - PHIÊN BẢN ĐÚNG
+   ========================================================= */
+
+/* Checkbox animation */
+.note-card .bulk-checkbox {
+    display: block;
+    opacity: 0;
+    transform: scale(0.5);
+    transition: opacity 0.2s cubic-bezier(0.34, 1.56, 0.64, 1),
+                transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+    pointer-events: none;
+}
+.bulk-mode .note-card .bulk-checkbox {
+    opacity: 1;
+    transform: scale(1);
+    pointer-events: auto;
+}
+
+/* Toolbar – cố định giữa dưới, có animation trượt lên/xuống */
+#bulkToolbar {
+    position: fixed !important;
+    bottom: 20px !important;
+    left: 50% !important;
+    transform: translateX(-50%) translateY(100%);
+    opacity: 0;
+    z-index: 1060;
+    background: rgba(255,255,255,0.28);
+    backdrop-filter: blur(32px) saturate(200%);
+    border-radius: 60px;
+    padding: 8px 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.12), 0 1px 0 rgba(255,255,255,0.4) inset;
+    border: 1px solid rgba(255,255,255,0.4);
+    transition: transform 0.35s cubic-bezier(0.34, 1.2, 0.64, 1), opacity 0.3s ease;
+    display: flex !important;
+    justify-content: center !important;
+    align-items: center;
+    gap: 12px;
+    width: auto;
+    min-width: 200px;
+}
+
+#bulkToolbar.bulk-toolbar-visible {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+}
+
+#bulkToolbar .btn {
+    border-radius: 40px !important;
+    padding: 6px 18px !important;
+    font-weight: 500;
+    transition: transform 0.2s ease, background 0.2s;
+}
+#bulkToolbar .btn:hover {
+    transform: translateY(-2px);
+}
+#bulkToolbar #bulkCounter {
+    background: rgba(0,0,0,0.3);
+    backdrop-filter: blur(4px);
+    border-radius: 40px;
+    padding: 2px 12px;
+    margin-left: 4px;
+    font-size: 0.9rem;
+}
+
+/* Vô hiệu hóa class d-none nếu có trong HTML (để tránh xung đột) */
+#bulkToolbar.d-none {
+    display: flex !important;
 }
 
 //----//
@@ -3724,6 +3807,7 @@ const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+let resetChoiceModal = null; // Thêm dòng này
 let profileSubScreen    = null; // Biến mới cho profile
 
 function resetPasswordModalToDefault() {
@@ -3802,6 +3886,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Modals Bootstrap ---
     noteModal          = new bootstrap.Modal(document.getElementById('noteModal'));
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
+    resetChoiceModal = new bootstrap.Modal(document.getElementById('resetChoiceModal'));
     customAlertModal   = new bootstrap.Modal(document.getElementById('customAlertModal'));
     customConfirmModal = new bootstrap.Modal(document.getElementById('customConfirmModal'));
     const passwordModalEl = document.getElementById('passwordModal');
@@ -4074,10 +4159,39 @@ function updateBulkToolbar() {
     const permanentBtn = document.getElementById('bulkPermanentBtn');
     const shareBtn = document.getElementById('bulkShareBtn');
     
-    if (deleteBtn) deleteBtn.style.display = isTrash ? 'none' : 'inline-flex';
-    if (restoreBtn) restoreBtn.style.display = isTrash ? 'inline-flex' : 'none';
-    if (permanentBtn) permanentBtn.style.display = isTrash ? 'inline-flex' : 'none';
-    if (shareBtn) shareBtn.style.display = (currentViewMode === 'my_notes' && !isTrash) ? 'inline-flex' : 'none';
+    // Xóa class d-none và thêm d-inline-flex (hoặc d-flex) cho các nút cần hiển thị
+    if (deleteBtn) {
+        if (isTrash) {
+            deleteBtn.classList.add('d-none');
+        } else {
+            deleteBtn.classList.remove('d-none');
+            deleteBtn.classList.add('d-inline-flex');
+        }
+    }
+    if (restoreBtn) {
+        if (isTrash) {
+            restoreBtn.classList.remove('d-none');
+            restoreBtn.classList.add('d-inline-flex');
+        } else {
+            restoreBtn.classList.add('d-none');
+        }
+    }
+    if (permanentBtn) {
+        if (isTrash) {
+            permanentBtn.classList.remove('d-none');
+            permanentBtn.classList.add('d-inline-flex');
+        } else {
+            permanentBtn.classList.add('d-none');
+        }
+    }
+    if (shareBtn) {
+        if (currentViewMode === 'my_notes' && !isTrash) {
+            shareBtn.classList.remove('d-none');
+            shareBtn.classList.add('d-inline-flex');
+        } else {
+            shareBtn.classList.add('d-none');
+        }
+    }
 }
 
 function toggleBulkMode() {
@@ -4088,13 +4202,18 @@ function toggleBulkMode() {
     
     if (bulkMode) {
         container.classList.add('bulk-mode');
-        toolbar.classList.remove('d-none');
+        // Thay vì remove d-none, thêm class visible để toolbar trượt lên
+        toolbar.classList.remove('bulk-toolbar-visible');
+        // Force reflow để transition hoạt động
+        void toolbar.offsetWidth;
+        toolbar.classList.add('bulk-toolbar-visible');
         toggleBtn.classList.add('active');
         selectedNotes.clear();
-        updateBulkToolbar();
+        updateBulkToolbar();  // Cập nhật trạng thái các nút dựa trên view hiện tại
     } else {
         container.classList.remove('bulk-mode');
-        toolbar.classList.add('d-none');
+        // Ẩn toolbar bằng class thay vì d-none
+        toolbar.classList.remove('bulk-toolbar-visible');
         toggleBtn.classList.remove('active');
         // Bỏ chọn tất cả checkbox
         document.querySelectorAll('.bulk-checkbox').forEach(cb => {
@@ -5749,10 +5868,13 @@ async function savePreferences() {
 }
 
 function showForgotPasswordModal() {
-    showConfirm('Bạn muốn nhận OTP hay link reset qua email?', 
-        () => sendResetRequest('otp'),
-        () => sendResetRequest('link')
-    );
+    const email = window.APP_CONFIG?.email;
+    if (!email) {
+        showToast('Không tìm thấy email của bạn', 'danger');
+        return;
+    }
+    // Chuyển hướng đến trang reset_password.php với email được điền sẵn
+    window.location.href = `reset_password.php?email=${encodeURIComponent(email)}`;
 }
 
 async function sendResetRequest(type) {
@@ -8015,7 +8137,7 @@ $user_avatar = !empty($_SESSION['avatar'])
 
     <div id="notesContainer" class="note-grid-view pb-5"></div>
     <!-- Bulk action toolbar (ẩn mặc định) -->
-<div id="bulkToolbar" class="fixed-bottom mb-3 d-none justify-content-center">
+    <div id="bulkToolbar" class="fixed-bottom mb-3">
     <div class="bg-body-tertiary rounded-pill shadow-lg p-2 d-flex gap-2">
         <button id="bulkDeleteBtn" class="btn btn-sm btn-danger rounded-pill"><i class="bi bi-trash3"></i> Xóa</button>
         <button id="bulkRestoreBtn" class="btn btn-sm btn-success rounded-pill d-none"><i class="bi bi-arrow-counterclockwise"></i> Khôi phục</button>
@@ -8205,6 +8327,11 @@ function sendActivationEmail($toEmail, $displayName, $token)
 {
     $mail = new PHPMailer(true);
 
+    // Lấy URL động
+    $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'];
+    $activationLink = "$protocol://$host/activate.php?token=" . $token;
+
     try {
         $mail->SMTPDebug = 0;
         $mail->isSMTP();
@@ -8226,8 +8353,6 @@ function sendActivationEmail($toEmail, $displayName, $token)
         $mail->CharSet = 'UTF-8';
         $mail->setFrom('trandanh020906@gmail.com', 'Note App');
         $mail->addAddress($toEmail, $displayName);
-
-        $activationLink = "http://localhost/activate.php?token=" . $token;
 
         $mail->isHTML(true);
         $mail->Subject = 'Kích hoạt tài khoản Note App';
@@ -8299,11 +8424,16 @@ function sendResetOTPEmail($toEmail, $displayName, $otp)
 }
 
 /**
- * Gửi Link Reset Password
+ * Gửi Link Reset Password (đã sửa dynamic URL)
  */
 function sendResetLinkEmail($toEmail, $displayName, $reset_token)
 {
     $mail = new PHPMailer(true);
+
+    // Lấy URL động
+    $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'];
+    $resetLink = "$protocol://$host/reset_password.php?token=" . $reset_token;
 
     try {
         $mail->SMTPDebug = 0;
@@ -8326,8 +8456,6 @@ function sendResetLinkEmail($toEmail, $displayName, $reset_token)
         $mail->CharSet = 'UTF-8';
         $mail->setFrom('trandanh020906@gmail.com', 'Note App');
         $mail->addAddress($toEmail, $displayName);
-
-        $resetLink = "http://localhost/reset_password.php?token=" . $reset_token;
 
         $mail->isHTML(true);
         $mail->Subject = 'Đặt lại mật khẩu - Note App';
@@ -8361,6 +8489,7 @@ function sendResetLinkEmail($toEmail, $displayName, $reset_token)
         return false;
     }
 }
+
 /**
  * Gửi thông báo mật khẩu đã thay đổi
  */
@@ -8397,8 +8526,9 @@ function sendPasswordChangedNotification($toEmail, $displayName)
         error_log("Password Changed Notification Error: " . $e->getMessage());
     }
 }
+
 /**
- * Gửi email thông báo khi note được chia sẻ (Better Approach)
+ * Gửi email thông báo khi note được chia sẻ
  */
 function sendShareNotification($toEmail, $displayName, $sharerName, $noteTitle)
 {
@@ -8675,6 +8805,31 @@ modals.php
         </div>
     </div>
 </div>
+<!-- Modal chọn phương thức reset mật khẩu (dùng trong profile) -->
+<div class="modal fade" id="resetChoiceModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content shadow">
+            <div class="modal-header border-0">
+                <h5 class="modal-title fw-bold text-primary">Khôi phục mật khẩu</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-center py-4">
+                <p class="mb-4">Chọn phương thức nhận mã khôi phục mật khẩu:</p>
+                <div class="d-grid gap-3">
+                    <button id="resetChoiceOtpBtn" class="btn btn-outline-primary btn-lg py-3">
+                        <i class="bi bi-envelope-paper fs-4 me-2"></i> Gửi mã OTP
+                    </button>
+                    <button id="resetChoiceLinkBtn" class="btn btn-outline-success btn-lg py-3">
+                        <i class="bi bi-link-45deg fs-4 me-2"></i> Gửi link đặt lại mật khẩu
+                    </button>
+                </div>
+            </div>
+            <div class="modal-footer border-0 justify-content-center">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+            </div>
+        </div>
+    </div>
+</div>
 //----//
 
 register.php
@@ -8733,6 +8888,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Auto login
                     $_SESSION['user_id']      = $user_id;
                     $_SESSION['display_name'] = $display_name;
+                    $_SESSION['email']        = $email;   // ← ĐÃ SỬA: thêm email vào session
                     $_SESSION['avatar']       = 'uploads/avatars/default-avatar.png';
                     $_SESSION['font_size']    = '16px';
                     $_SESSION['theme_color']  = 'light';
@@ -9000,29 +9156,47 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
                 <?= $message ?>
 
                 <?php if ($step == 1): ?>
-                    <form method="POST">
+                    <form method="POST" id="resetFormStep1">
                         <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                         <input type="hidden" name="action" value="send_reset">
 
                         <div class="mb-3">
                             <label class="form-label">Nhập email tài khoản</label>
-                            <input type="email" name="email" class="form-control" required>
+                            <input type="email" name="email" id="resetEmailInput" class="form-control" required>
                         </div>
 
                         <div class="mb-3">
                             <label class="form-label">Chọn phương thức khôi phục:</label><br>
                             <div class="form-check">
-                                <input class="form-check-input" type="radio" name="type" value="otp" checked>
-                                <label class="form-check-label">Gửi mã OTP</label>
+                                <input class="form-check-input" type="radio" name="type" value="otp" id="typeOtp" checked>
+                                <label class="form-check-label" for="typeOtp">Gửi mã OTP</label>
                             </div>
                             <div class="form-check">
-                                <input class="form-check-input" type="radio" name="type" value="link">
-                                <label class="form-check-label">Gửi link đặt lại mật khẩu</label>
+                                <input class="form-check-input" type="radio" name="type" value="link" id="typeLink">
+                                <label class="form-check-label" for="typeLink">Gửi link đặt lại mật khẩu</label>
                             </div>
                         </div>
 
                         <button type="submit" class="btn btn-primary w-100">Tiếp tục</button>
                     </form>
+
+                    <div class="text-center mt-3">
+                        <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
+                    </div>
+
+                    <script>
+                        (function() {
+                            const urlParams = new URLSearchParams(window.location.search);
+                            const emailFromProfile = urlParams.get('email');
+                            if (emailFromProfile) {
+                                const emailInput = document.getElementById('resetEmailInput');
+                                if (emailInput) {
+                                    emailInput.value = emailFromProfile;
+                                    // Không khóa readonly để người dùng có thể sửa nếu nhầm
+                                }
+                            }
+                        })();
+                    </script>
 
                 <?php elseif ($step == 2): ?>
                     <form method="POST">
@@ -9049,11 +9223,11 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
                         <button type="submit" class="btn btn-success w-100">Đổi mật khẩu</button>
                     </form>
-                <?php endif; ?>
 
-                <div class="text-center mt-3">
-                    <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
-                </div>
+                    <div class="text-center mt-3">
+                        <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
+                    </div>
+                <?php endif; ?>
             </div>
         </div>
     </div>

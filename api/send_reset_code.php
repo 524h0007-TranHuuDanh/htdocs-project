@@ -20,15 +20,17 @@ if (!$user) {
 
 $reset_token = bin2hex(random_bytes(32));
 $expiry = date('Y-m-d H:i:s', strtotime('+15 minutes'));
-$pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
-    ->execute([$reset_token, $expiry, $user_id]);
 
 if ($type === 'link') {
+    $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
+        ->execute([$reset_token, $expiry, $user_id]);
     $sent = sendResetLinkEmail($user['email'], $user['display_name'], $reset_token);
     $msg = 'Link đặt lại mật khẩu đã được gửi';
 } else {
     $otp = rand(100000, 999999);
-    $pdo->prepare("UPDATE users SET reset_token = ? WHERE id = ?")->execute([$otp, $user_id]);
+    // SỬA: thêm reset_token_expiry cho OTP (giống link)
+    $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?")
+        ->execute([$otp, $expiry, $user_id]);
     $sent = sendResetOTPEmail($user['email'], $user['display_name'], $otp);
     $msg = 'Mã OTP đã được gửi';
 }

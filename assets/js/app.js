@@ -3,6 +3,8 @@
 const currentUserId   = window.APP_CONFIG?.userId   ?? 0;
 const currentUserName = window.APP_CONFIG?.userName  ?? 'User';
 
+let renameLabelId = null;
+let renameLabelCurrentName = '';
 let typingTimer, searchTimer;
 let currentLabelId      = null;
 let currentViewMode     = 'my_notes';
@@ -39,6 +41,7 @@ const OFFLINE_SYNC_MAX_DELAY_MS  = 120000;
 let noteModal           = null;
 let customAlertModal    = null;
 let customConfirmModal  = null;
+let resetChoiceModal = null; // Thêm dòng này
 let profileSubScreen    = null; // Biến mới cho profile
 
 function resetPasswordModalToDefault() {
@@ -117,6 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Modals Bootstrap ---
     noteModal          = new bootstrap.Modal(document.getElementById('noteModal'));
     passwordModalInstance = new bootstrap.Modal(document.getElementById('passwordModal'));
+    resetChoiceModal = new bootstrap.Modal(document.getElementById('resetChoiceModal'));
     customAlertModal   = new bootstrap.Modal(document.getElementById('customAlertModal'));
     customConfirmModal = new bootstrap.Modal(document.getElementById('customConfirmModal'));
     const passwordModalEl = document.getElementById('passwordModal');
@@ -389,10 +393,39 @@ function updateBulkToolbar() {
     const permanentBtn = document.getElementById('bulkPermanentBtn');
     const shareBtn = document.getElementById('bulkShareBtn');
     
-    if (deleteBtn) deleteBtn.style.display = isTrash ? 'none' : 'inline-flex';
-    if (restoreBtn) restoreBtn.style.display = isTrash ? 'inline-flex' : 'none';
-    if (permanentBtn) permanentBtn.style.display = isTrash ? 'inline-flex' : 'none';
-    if (shareBtn) shareBtn.style.display = (currentViewMode === 'my_notes' && !isTrash) ? 'inline-flex' : 'none';
+    // Xóa class d-none và thêm d-inline-flex (hoặc d-flex) cho các nút cần hiển thị
+    if (deleteBtn) {
+        if (isTrash) {
+            deleteBtn.classList.add('d-none');
+        } else {
+            deleteBtn.classList.remove('d-none');
+            deleteBtn.classList.add('d-inline-flex');
+        }
+    }
+    if (restoreBtn) {
+        if (isTrash) {
+            restoreBtn.classList.remove('d-none');
+            restoreBtn.classList.add('d-inline-flex');
+        } else {
+            restoreBtn.classList.add('d-none');
+        }
+    }
+    if (permanentBtn) {
+        if (isTrash) {
+            permanentBtn.classList.remove('d-none');
+            permanentBtn.classList.add('d-inline-flex');
+        } else {
+            permanentBtn.classList.add('d-none');
+        }
+    }
+    if (shareBtn) {
+        if (currentViewMode === 'my_notes' && !isTrash) {
+            shareBtn.classList.remove('d-none');
+            shareBtn.classList.add('d-inline-flex');
+        } else {
+            shareBtn.classList.add('d-none');
+        }
+    }
 }
 
 function toggleBulkMode() {
@@ -403,13 +436,18 @@ function toggleBulkMode() {
     
     if (bulkMode) {
         container.classList.add('bulk-mode');
-        toolbar.classList.remove('d-none');
+        // Thay vì remove d-none, thêm class visible để toolbar trượt lên
+        toolbar.classList.remove('bulk-toolbar-visible');
+        // Force reflow để transition hoạt động
+        void toolbar.offsetWidth;
+        toolbar.classList.add('bulk-toolbar-visible');
         toggleBtn.classList.add('active');
         selectedNotes.clear();
-        updateBulkToolbar();
+        updateBulkToolbar();  // Cập nhật trạng thái các nút dựa trên view hiện tại
     } else {
         container.classList.remove('bulk-mode');
-        toolbar.classList.add('d-none');
+        // Ẩn toolbar bằng class thay vì d-none
+        toolbar.classList.remove('bulk-toolbar-visible');
         toggleBtn.classList.remove('active');
         // Bỏ chọn tất cả checkbox
         document.querySelectorAll('.bulk-checkbox').forEach(cb => {
@@ -601,6 +639,9 @@ function submitNotePassword() {
 }
 
 function openNoteModal(id = '', title = '', content = '', color = '', permission = 'owner', ownerName = '') {
+    // Reset biến đếm retry khi mở một note mới
+    window._conflictRetryCount = 0;
+
     currentPermission = permission;
     currentNoteId     = id;
 
@@ -610,6 +651,8 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
 
     const contentEl = document.getElementById('noteContent');
     delete contentEl.dataset.version;
+    // Đặt version tạm thời là '0' (sẽ được cập nhật sau khi fetch từ server)
+    contentEl.dataset.version = '0';
 
     document.getElementById('imagePreviewContainer').innerHTML = '';
     document.getElementById('noteLabelsContainer').innerHTML   = '';
@@ -638,7 +681,7 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
                     contentEl.dataset.version = String(note.version);
                 }
             })
-            .catch(() => {})
+            .catch(() => { /* giữ nguyên version '0' nếu fetch lỗi */ })
             .finally(() => {
                 if (fetchGen === noteVersionFetchGen) {
                     noteVersionLoadPending = false;
@@ -707,20 +750,17 @@ function openNoteModal(id = '', title = '', content = '', color = '', permission
         }
     }
 
-    // --- Placeholder cho note mới ---
     if (!id) {
         document.getElementById('noteTitle').placeholder   = 'Nhập tiêu đề ghi chú...';
         document.getElementById('noteContent').placeholder = 'Nhập nội dung ghi chú của bạn...';
     }
 
-    // --- Khởi động realtime (một lần duy nhất) ---
     if (id && (permission === 'edit' || permission === 'owner')) {
         startRealtimeForNote(id, permission);
     }
 
     noteModal.show();
 }
-
 // ====================== AUTO REFRESH ======================
 function startAutoRefresh() {
     if (autoRefreshInterval) clearInterval(autoRefreshInterval);
@@ -799,7 +839,6 @@ function autoSave() {
                 return;
             }
 
-            // --- OFFLINE: lưu cục bộ ngay lập tức ---
             if (!navigator.onLine) {
                 const vOff = getNoteContentVersion();
                 const noteData = {
@@ -816,7 +855,6 @@ function autoSave() {
                 return;
             }
 
-            // --- ONLINE: gửi lên server ---
             const verNum = getNoteContentVersion();
             if (nid && !Number.isFinite(verNum)) {
                 document.getElementById('saveStatus').innerText = '';
@@ -845,36 +883,30 @@ function autoSave() {
                         clearTimeout(autoSaveRetryTimer);
                         autoSaveRetryTimer = null;
 
-                        const titleEl = document.getElementById('noteTitle');
-                        const hasLatestTitle   = d.latest_title !== undefined;
-                        const hasLatestContent = d.latest_content !== undefined;
-
-                        noteConflictResolutionLock = true;
-                        window.__remoteUpdating = true;
-                        try {
-                            if (hasLatestTitle) {
-                                titleEl.value = d.latest_title;
-                            }
-                            if (hasLatestContent) {
-                                contentEl.value = d.latest_content;
-                            }
-                            if (hasLatestTitle && hasLatestContent &&
-                                d.version !== undefined && d.version !== null && d.version !== '') {
-                                contentEl.dataset.version = String(d.version);
-                            }
-                            lastAutoSavePersistSig = _autoSavePayloadSignature();
-                        } finally {
-                            window.__remoteUpdating = false;
-                            noteConflictResolutionLock = false;
+                        const serverVersion = d.version;
+                        if (!window._conflictRetryCount) window._conflictRetryCount = 0;
+                        if (window._conflictRetryCount >= 2) {
+                            window._conflictRetryCount = 0;
+                            statusEl.innerHTML = '<i class="bi bi-exclamation-triangle-fill text-danger"></i> Xung đột, vui lòng thử lại';
+                            showToast('Không thể đồng bộ do xung đột liên tục, vui lòng tải lại trang.', 'danger');
+                            return;
                         }
 
-                        statusEl.innerHTML = '<i class="bi bi-arrow-clockwise text-warning"></i> Đồng bộ từ máy chủ';
-                        showToast(
-                            'Nội dung đã được đồng bộ với bản mới nhất trên máy chủ. Tiếp tục chỉnh sửa để lưu.',
-                            'warning'
-                        );
+                        if (serverVersion !== undefined && serverVersion !== null && serverVersion !== '') {
+                            contentEl.dataset.version = String(serverVersion);
+                            window._conflictRetryCount++;
+                        }
+
+                        statusEl.innerHTML = '<i class="bi bi-arrow-repeat text-info"></i> Đang đồng bộ lại...';
+                        autoSaveRetryTimer = setTimeout(() => {
+                            autoSaveRetryTimer = null;
+                            autoSave();
+                        }, 300);
                         return;
                     }
+
+                    // Lưu thành công -> reset retry counter
+                    window._conflictRetryCount = 0;
 
                     if (d.success) {
                         statusEl.innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> Đã lưu';
@@ -898,7 +930,6 @@ function autoSave() {
                 })
                 .catch(() => {
                     if (mySeq !== autoSaveInFlightSeq) return;
-
                     document.getElementById('saveStatus').innerHTML =
                         '<span class="text-warning"><i class="bi bi-cloud-slash"></i> Lưu offline</span>';
                     const noteData = {
@@ -928,9 +959,8 @@ function autoSave() {
                     }, 0);
                 });
         };
-
         runCommitted();
-    }, 800);
+    }, 1000);
 }
 
 // ====================== CHIA SẺ ======================
@@ -997,6 +1027,8 @@ function revokeShare(shareId) {
 function toggleLock() {
     const id = document.getElementById('noteId').value;
     if (!id) return;
+    // Kiểm tra xem note đã có mật khẩu chưa? Lấy từ dataset hoặc gọi API? 
+    // Hiện tại dùng biến isLockedState (được set khi mở note có password_hash)
     if (isLockedState) {
         _showLockActionPicker(id);
     } else {
@@ -1011,18 +1043,22 @@ function _showLockSetModal(id) {
             { id: 'pm_new_pw',     placeholder: 'Mật khẩu mới (≥ 4 ký tự)', type: 'password' },
             { id: 'pm_confirm_pw', placeholder: 'Nhập lại mật khẩu',         type: 'password' }
         ],
-        onConfirm(vals, showError) {
+        onConfirm: (vals, showError) => {
             const [pw, pw2] = vals;
-            if (pw.length < 4) return showError('Mật khẩu phải có ít nhất 4 ký tự!');
-            if (pw !== pw2)    return showError('Mật khẩu xác nhận không khớp!');
-
+            if (pw.length < 4) {
+                showError('Mật khẩu phải có ít nhất 4 ký tự!');
+                return false;
+            }
+            if (pw !== pw2) {
+                showError('Mật khẩu xác nhận không khớp!');
+                return false;
+            }
             const fd = new FormData();
             fd.append('note_id',          id);
             fd.append('action',           'lock');
             fd.append('password',         pw);
             fd.append('confirm_password', pw2);
             appendCsrfToken(fd);
-
             return fetch('api/lock_note.php', { method: 'POST', body: fd })
                 .then(r => r.json())
                 .then(d => {
@@ -1031,14 +1067,14 @@ function _showLockSetModal(id) {
                         document.getElementById('btnLock').innerHTML = '<i class="bi bi-unlock"></i> Mở khóa';
                         liveSearch();
                         return true;
+                    } else {
+                        showError(d.message || 'Không thể đặt khóa!');
+                        return false;
                     }
-                    showError(d.message || 'Không thể đặt khóa!');
-                    return false;
                 });
         }
     });
 }
-
 function _showLockActionPicker(id) {
     _openPasswordModal({
         title: '🔒 Ghi chú đang được khóa',
@@ -1049,75 +1085,173 @@ function _showLockActionPicker(id) {
             { label: 'Gỡ khóa',      style: 'btn-warning', value: 'unlock' },
             { label: 'Đổi mật khẩu', style: 'btn-primary', value: 'change' }
         ],
-        onConfirm(vals, showError, actionValue) {
-            const [oldPw] = vals;
-            if (!oldPw) return showError('Vui lòng nhập mật khẩu hiện tại!');
-
+        onConfirm: (vals, showError, actionValue) => {
+            const oldPw = vals[0];
+            if (!oldPw) {
+                showError('Vui lòng nhập mật khẩu hiện tại!');
+                return false;
+            }
+            // Gửi request verify mật khẩu cũ
             const fd = new FormData();
             fd.append('note_id',      id);
             fd.append('old_password', oldPw);
+            fd.append('action',       'verify');
             appendCsrfToken(fd);
-
-            if (actionValue === 'unlock') {
-                fd.append('action', 'unlock');
-                return fetch('api/lock_note.php', { method: 'POST', body: fd })
-                    .then(r => r.json())
-                    .then(d => {
-                        if (d.success) {
-                            isLockedState = false;
-                            document.getElementById('btnLock').innerHTML = '<i class="bi bi-lock"></i> Đặt mật khẩu';
-                            liveSearch();
-                            return true;
-                        }
-                        showError(d.message || 'Mật khẩu không đúng!');
-                        return false;
-                    });
-            } else {
-                fd.append('action', 'verify');
-                return fetch('api/lock_note.php', { method: 'POST', body: fd })
-                    .then(r => r.json())
-                    .then(d => {
-                        if (!d.success) { showError(d.message || 'Mật khẩu không đúng!'); return false; }
-                        passwordModalInstance.hide();
-                        setTimeout(() => _showChangePasswordModal(id, oldPw), 300);
-                        return false;
-                    });
-            }
-        }
-    });
-}
-
-function _showChangePasswordModal(id, oldPw) {
-    _openPasswordModal({
-        title: '🔑 Đặt mật khẩu mới',
-        fields: [
-            { id: 'pm_new_pw',     placeholder: 'Mật khẩu mới (≥ 4 ký tự)', type: 'password' },
-            { id: 'pm_confirm_pw', placeholder: 'Nhập lại mật khẩu',         type: 'password' }
-        ],
-        onConfirm(vals, showError) {
-            const [pw, pw2] = vals;
-            if (pw.length < 4) return showError('Mật khẩu phải có ít nhất 4 ký tự!');
-            if (pw !== pw2)    return showError('Mật khẩu xác nhận không khớp!');
-
-            const fd = new FormData();
-            fd.append('note_id',          id);
-            fd.append('action',           'change');
-            fd.append('old_password',     oldPw);
-            fd.append('password',         pw);
-            fd.append('confirm_password', pw2);
-            appendCsrfToken(fd);
-
             return fetch('api/lock_note.php', { method: 'POST', body: fd })
                 .then(r => r.json())
                 .then(d => {
-                    if (d.success) { liveSearch(); return true; }
-                    showError(d.message || 'Không thể đổi mật khẩu!');
+                    if (!d.success) {
+                        showError(d.message || 'Mật khẩu không đúng!');
+                        return false;
+                    }
+                    // Xác thực thành công
+                    if (actionValue === 'unlock') {
+                        // Gửi yêu cầu mở khóa
+                        const fdUnlock = new FormData();
+                        fdUnlock.append('note_id',      id);
+                        fdUnlock.append('old_password', oldPw);
+                        fdUnlock.append('action',       'unlock');
+                        appendCsrfToken(fdUnlock);
+                        return fetch('api/lock_note.php', { method: 'POST', body: fdUnlock })
+                            .then(r => r.json())
+                            .then(res => {
+                                if (res.success) {
+                                    isLockedState = false;
+                                    document.getElementById('btnLock').innerHTML = '<i class="bi bi-lock"></i> Đặt mật khẩu';
+                                    liveSearch();
+                                    return true;
+                                } else {
+                                    showError(res.message || 'Không thể mở khóa!');
+                                    return false;
+                                }
+                            });
+                    } else if (actionValue === 'change') {
+                        // Chuyển modal hiện tại sang chế độ đổi mật khẩu (không đóng modal)
+                        _switchToChangePasswordMode(id, oldPw);
+                        return false; // Không đóng modal tự động
+                    }
                     return false;
                 });
         }
     });
 }
 
+// function _showChangePasswordModal(id, oldPw) {
+//     // Kiểm tra oldPw có hợp lệ không
+//     if (!oldPw) {
+//         showToast('Lỗi: Không tìm thấy mật khẩu cũ!', 'danger');
+//         return;
+//     }
+//     _openPasswordModal({
+//         title: '🔑 Đặt mật khẩu mới',
+//         fields: [
+//             { id: 'pm_new_pw',     placeholder: 'Mật khẩu mới (≥ 4 ký tự)', type: 'password' },
+//             { id: 'pm_confirm_pw', placeholder: 'Nhập lại mật khẩu',         type: 'password' }
+//         ],
+//         onConfirm: (vals, showError) => {
+//             const [newPw, confirmPw] = vals;
+//             if (newPw.length < 4) {
+//                 showError('Mật khẩu phải có ít nhất 4 ký tự!');
+//                 return false;
+//             }
+//             if (newPw !== confirmPw) {
+//                 showError('Mật khẩu xác nhận không khớp!');
+//                 return false;
+//             }
+//             const fd = new FormData();
+//             fd.append('note_id',          id);
+//             fd.append('action',           'change');
+//             fd.append('old_password',     oldPw);  // Dùng oldPw từ tham số
+//             fd.append('password',         newPw);
+//             fd.append('confirm_password', confirmPw);
+//             appendCsrfToken(fd);
+//             return fetch('api/lock_note.php', { method: 'POST', body: fd })
+//                 .then(r => r.json())
+//                 .then(d => {
+//                     if (d.success) {
+//                         showToast('Đổi mật khẩu thành công!', 'success');
+//                         liveSearch();
+//                         return true;
+//                     } else {
+//                         showError(d.message || 'Không thể đổi mật khẩu!');
+//                         return false;
+//                     }
+//                 });
+//         }
+//     });
+// }
+function _switchToChangePasswordMode(id, oldPw) {
+    // Lấy các phần tử của modal hiện tại
+    const titleEl = document.getElementById('passwordModalTitle');
+    const bodyEl = document.getElementById('passwordModal').querySelector('.modal-body');
+    const footerEl = document.getElementById('passwordModal').querySelector('.modal-footer');
+    
+    // Thay đổi tiêu đề và nội dung modal thành giao diện đổi mật khẩu
+    titleEl.textContent = '🔑 Đặt mật khẩu mới';
+    bodyEl.innerHTML = `
+        <input type="password" id="pm_new_pw" class="form-control mb-2" placeholder="Mật khẩu mới (≥ 4 ký tự)" autocomplete="off">
+        <input type="password" id="pm_confirm_pw" class="form-control mb-2" placeholder="Nhập lại mật khẩu" autocomplete="off">
+        <div id="pm_error" class="text-danger small mt-1" style="display:none;"></div>
+    `;
+    
+    // Xóa các nút cũ và thêm nút xác nhận mới
+    footerEl.innerHTML = `
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hủy</button>
+        <button type="button" id="changePasswordConfirmBtn" class="btn btn-primary">Xác nhận</button>
+    `;
+    
+    const errorEl = document.getElementById('pm_error');
+    const confirmBtn = document.getElementById('changePasswordConfirmBtn');
+    
+    confirmBtn.onclick = () => {
+        const newPw = document.getElementById('pm_new_pw').value.trim();
+        const confirmPw = document.getElementById('pm_confirm_pw').value.trim();
+        
+        if (newPw.length < 4) {
+            errorEl.textContent = 'Mật khẩu phải có ít nhất 4 ký tự!';
+            errorEl.style.display = 'block';
+            return;
+        }
+        if (newPw !== confirmPw) {
+            errorEl.textContent = 'Mật khẩu xác nhận không khớp!';
+            errorEl.style.display = 'block';
+            return;
+        }
+        
+        errorEl.style.display = 'none';
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = 'Đang xử lý...';
+        
+        const fd = new FormData();
+        fd.append('note_id',          id);
+        fd.append('action',           'change');
+        fd.append('old_password',     oldPw);
+        fd.append('password',         newPw);
+        fd.append('confirm_password', confirmPw);
+        appendCsrfToken(fd);
+        
+        fetch('api/lock_note.php', { method: 'POST', body: fd })
+            .then(r => r.json())
+            .then(d => {
+                if (d.success) {
+                    showToast('Đổi mật khẩu thành công!', 'success');
+                    passwordModalInstance.hide();
+                    liveSearch();
+                } else {
+                    errorEl.textContent = d.message || 'Không thể đổi mật khẩu!';
+                    errorEl.style.display = 'block';
+                    confirmBtn.disabled = false;
+                    confirmBtn.textContent = 'Xác nhận';
+                }
+            })
+            .catch(() => {
+                errorEl.textContent = 'Lỗi kết nối, vui lòng thử lại!';
+                errorEl.style.display = 'block';
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = 'Xác nhận';
+            });
+    };
+}
 function _openPasswordModal(config) {
     const titleEl = document.getElementById('passwordModalTitle');
     const bodyEl = document.getElementById('passwordModal').querySelector('.modal-body');
@@ -1364,132 +1498,107 @@ function connectWebSocket() {
             };
 
             socket.onmessage = (event) => {
-                if (ws !== socket) return;
-                try {
-                    const data = JSON.parse(event.data);
+    if (ws !== socket) return;
+    try {
+        const data = JSON.parse(event.data);
 
-                    if (data.type === 'auth_error') {
-                        wsReady = false;
-                        _setWsStatus('offline');
-                        try { socket.close(); } catch (e2) {}
-                        return;
-                    }
+        if (data.type === 'auth_error') {
+            wsReady = false;
+            _setWsStatus('offline');
+            try { socket.close(); } catch (e2) {}
+            return;
+        }
 
-                    if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
-                        console.warn('[WS] join_denied:', data.message || '');
-                        return;
-                    }
+        if (data.type === 'join_denied' && data.note_id == currentNoteIdForWS) {
+            console.warn('[WS] join_denied:', data.message || '');
+            return;
+        }
 
-                    if (data.type === 'auth_success') {
-                        wsReady = true;
-                        _setWsStatus('online');
-                        if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
-                    }
+        if (data.type === 'auth_success') {
+            wsReady = true;
+            _setWsStatus('online');
+            if (currentNoteIdForWS) _wsSend({ type: 'join_note', note_id: currentNoteIdForWS });
+        }
 
-                    if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
-                        if (data.user_name === currentUserName) return;
+        // ================== XỬ LÝ CẬP NHẬT NỘI DUNG (ĐÃ SỬA) ==================
+        if (data.type === 'update' && data.note_id == currentNoteIdForWS) {
+            if (data.user_name === currentUserName) return;
 
-                        const contentElPre = document.getElementById('noteContent');
-                        const incomingVer = data.version != null && data.version !== ''
-                            ? parseInt(data.version, 10)
-                            : NaN;
-                        const rawLocal = contentElPre && contentElPre.dataset.version;
-                        const localVer = rawLocal !== undefined && rawLocal !== ''
-                            ? parseInt(rawLocal, 10)
-                            : NaN;
-                        if (Number.isFinite(incomingVer) && Number.isFinite(localVer) && incomingVer < localVer) {
-                            return;
-                        }
+            const contentEl = document.getElementById('noteContent');
+            const incomingVer = data.version != null && data.version !== '' ? parseInt(data.version, 10) : NaN;
+            const rawLocal = contentEl && contentEl.dataset.version;
+            const localVer = rawLocal !== undefined && rawLocal !== '' ? parseInt(rawLocal, 10) : NaN;
 
-                        const c = String(data.content ?? '');
-                        const inboundKey = [
-                            data.note_id,
-                            data.user_name,
-                            data.timestamp ?? '',
-                            data.title ?? '',
-                            c.length,
-                            c.slice(0, 256)
-                        ].join('\x1e');
-                        if (inboundKey === _lastWsInboundKey) return;
-                        _lastWsInboundKey = inboundKey;
+            // Chỉ cập nhật version nếu version mới lớn hơn version hiện tại (tránh ghi đè bằng version cũ)
+            if (Number.isFinite(incomingVer) && (!Number.isFinite(localVer) || incomingVer > localVer)) {
+                contentEl.dataset.version = String(incomingVer);
+            }
 
-                        const titleEl   = document.getElementById('noteTitle');
-                        const contentEl = document.getElementById('noteContent');
+            const titleEl   = document.getElementById('noteTitle');
+            const isEditingTitle   = document.activeElement === titleEl;
+            const isEditingContent = document.activeElement === contentEl;
 
-                        const isEditingTitle   = document.activeElement === titleEl;
-                        const isEditingContent = document.activeElement === contentEl;
-
-                        window.__remoteUpdating = true;
-                        try {
-                            if (data.version != null && data.version !== '') {
-                                contentEl.dataset.version = String(data.version);
-                            }
-
-                            if (data.title !== undefined && !isEditingTitle) {
-                                titleEl.value = data.title;
-                            }
-
-                            if (data.content !== undefined) {
-                                const currentContent  = contentEl.value    || '';
-                                const incomingContent = String(data.content);
-
-                                if (!isEditingContent) {
-                                    contentEl.value = incomingContent;
-                                } else {
-                                    const isDeleting   = incomingContent.length < currentContent.length;
-                                    const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
-
-                                    if (isDeleting || tooDifferent) {
-                                        const cursorPos = contentEl.selectionStart;
-                                        contentEl.value = incomingContent;
-                                        try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e3) {}
-                                    }
-                                }
-                            }
-                        } finally {
-                            window.__remoteUpdating = false;
-                        }
-
-                        _showTypingIndicator(data.user_name);
-                    }
-
-                    // ========== XỬ LÝ MÀU SẮC ==========
-                    if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
-                        const modalWrapper = document.getElementById('modalContentWrapper');
-                        if (modalWrapper) {
-                            modalWrapper.style.backgroundColor = data.color;
-                            modalWrapper.style.setProperty('--note-individual-color', data.color);
-                        }
-                        const cards = document.querySelectorAll('.note-card');
-                        cards.forEach(card => {
-                            const body = card.querySelector('.card-body');
-                            if (body && body.dataset.id == data.note_id) {
-                                card.style.backgroundColor = data.color;
-                            }
-                        });
-                        _showTypingIndicator(data.user_name + ' đã đổi màu');
-                    }
-
-                    // ========== XỬ LÝ THÊM ẢNH ==========
-                    if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
-                        renderImage(data.file_path, data.image_id, currentPermission);
-                        _showTypingIndicator(data.user_name + ' đã thêm ảnh');
-                    }
-
-                    // ========== XỬ LÝ XÓA ẢNH ==========
-                    if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
-                        const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
-                        if (imgDiv) imgDiv.remove();
-                        _showTypingIndicator(data.user_name + ' đã xóa ảnh');
-                    }
-
-                    if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
-                        _renderPresence(data.users);
-                    }
-                } catch (e) {
-                    console.error('WS parse error:', e);
+            window.__remoteUpdating = true;
+            try {
+                if (data.title !== undefined && !isEditingTitle) {
+                    titleEl.value = data.title;
                 }
-            };
+                if (data.content !== undefined) {
+                    const currentContent  = contentEl.value    || '';
+                    const incomingContent = String(data.content);
+                    if (!isEditingContent) {
+                        contentEl.value = incomingContent;
+                    } else {
+                        const isDeleting   = incomingContent.length < currentContent.length;
+                        const tooDifferent = Math.abs(incomingContent.length - currentContent.length) > 5;
+                        if (isDeleting || tooDifferent) {
+                            const cursorPos = contentEl.selectionStart;
+                            contentEl.value = incomingContent;
+                            try { contentEl.setSelectionRange(cursorPos, cursorPos); } catch (e) {}
+                        }
+                    }
+                }
+            } finally {
+                window.__remoteUpdating = false;
+            }
+            _showTypingIndicator(data.user_name);
+        }
+
+        // ========== GIỮ NGUYÊN CÁC TYPE KHÁC ==========
+        if (data.type === 'color_update' && data.note_id == currentNoteIdForWS) {
+            const modalWrapper = document.getElementById('modalContentWrapper');
+            if (modalWrapper) {
+                modalWrapper.style.backgroundColor = data.color;
+                modalWrapper.style.setProperty('--note-individual-color', data.color);
+            }
+            const cards = document.querySelectorAll('.note-card');
+            cards.forEach(card => {
+                const body = card.querySelector('.card-body');
+                if (body && body.dataset.id == data.note_id) {
+                    card.style.backgroundColor = data.color;
+                }
+            });
+            _showTypingIndicator(data.user_name + ' đã đổi màu');
+        }
+
+        if (data.type === 'image_added' && data.note_id == currentNoteIdForWS) {
+            renderImage(data.file_path, data.image_id, currentPermission);
+            _showTypingIndicator(data.user_name + ' đã thêm ảnh');
+        }
+
+        if (data.type === 'image_deleted' && data.note_id == currentNoteIdForWS) {
+            const imgDiv = document.querySelector(`#imagePreviewContainer [data-image-id="${data.image_id}"]`);
+            if (imgDiv) imgDiv.remove();
+            _showTypingIndicator(data.user_name + ' đã xóa ảnh');
+        }
+
+        if (data.type === 'presence' && data.note_id == currentNoteIdForWS) {
+            _renderPresence(data.users);
+        }
+    } catch (e) {
+        console.error('WS parse error:', e);
+    }
+};
 
             socket.onclose = () => {
                 if (ws !== socket) return;
@@ -1719,13 +1828,71 @@ function addNewLabel() {
 }
 
 function renameLabel(id, currentName) {
-    const newName = prompt('Đổi tên nhãn:', currentName);
-    if (!newName || newName.trim() === '' || newName === currentName) return;
-    fetch('api/manage_labels.php?action=rename', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    appendCsrfUrlEncoded(`id=${id}&name=${encodeURIComponent(newName.trim())}`)
-    }).then(() => loadFilterLabels(() => liveSearch()));
+    renameLabelId = id;
+    renameLabelCurrentName = currentName;
+    
+    const inputEl = document.getElementById('renameLabelInput');
+    const errorEl = document.getElementById('renameLabelError');
+    if (inputEl) inputEl.value = currentName;
+    if (errorEl) errorEl.style.display = 'none';
+    
+    const modalEl = document.getElementById('renameLabelModal');
+    const modal = new bootstrap.Modal(modalEl);
+    modal.show();
+    
+    // Focus vào input sau khi modal hiển thị
+    setTimeout(() => {
+        if (inputEl) {
+            inputEl.focus();
+            inputEl.select();
+        }
+    }, 300);
+    
+    // Gắn sự kiện cho nút xác nhận (loại bỏ listener cũ để tránh trùng lặp)
+    const confirmBtn = document.getElementById('renameLabelConfirmBtn');
+    const newConfirmBtn = confirmBtn.cloneNode(true);
+    confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+    
+    newConfirmBtn.onclick = function() {
+        const newName = inputEl.value.trim();
+        if (!newName) {
+            if (errorEl) {
+                errorEl.textContent = 'Tên nhãn không được để trống!';
+                errorEl.style.display = 'block';
+            }
+            return;
+        }
+        if (newName === renameLabelCurrentName) {
+            modal.hide();
+            return;
+        }
+        
+        // Gửi request đổi tên
+        fetch('api/manage_labels.php?action=rename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: appendCsrfUrlEncoded(`id=${renameLabelId}&name=${encodeURIComponent(newName)}`)
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                modal.hide();
+                loadFilterLabels(() => liveSearch());
+                showToast('Đã đổi tên nhãn thành công', 'success');
+            } else {
+                if (errorEl) {
+                    errorEl.textContent = data.message || 'Lỗi khi đổi tên nhãn!';
+                    errorEl.style.display = 'block';
+                }
+            }
+        })
+        .catch(() => {
+            if (errorEl) {
+                errorEl.textContent = 'Lỗi kết nối!';
+                errorEl.style.display = 'block';
+            }
+        });
+    };
 }
 
 function deleteLabel(id) {
@@ -2064,10 +2231,13 @@ async function savePreferences() {
 }
 
 function showForgotPasswordModal() {
-    showConfirm('Bạn muốn nhận OTP hay link reset qua email?', 
-        () => sendResetRequest('otp'),
-        () => sendResetRequest('link')
-    );
+    const email = window.APP_CONFIG?.email;
+    if (!email) {
+        showToast('Không tìm thấy email của bạn', 'danger');
+        return;
+    }
+    // Chuyển hướng đến trang reset_password.php với email được điền sẵn
+    window.location.href = `reset_password.php?email=${encodeURIComponent(email)}`;
 }
 
 async function sendResetRequest(type) {

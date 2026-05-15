@@ -9,6 +9,11 @@ function sendActivationEmail($toEmail, $displayName, $token)
 {
     $mail = new PHPMailer(true);
 
+    // Lấy URL động
+    $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'];
+    $activationLink = "$protocol://$host/activate.php?token=" . $token;
+
     try {
         $mail->SMTPDebug = 0;
         $mail->isSMTP();
@@ -30,8 +35,6 @@ function sendActivationEmail($toEmail, $displayName, $token)
         $mail->CharSet = 'UTF-8';
         $mail->setFrom('trandanh020906@gmail.com', 'Note App');
         $mail->addAddress($toEmail, $displayName);
-
-        $activationLink = "http://localhost/activate.php?token=" . $token;
 
         $mail->isHTML(true);
         $mail->Subject = 'Kích hoạt tài khoản Note App';
@@ -103,11 +106,16 @@ function sendResetOTPEmail($toEmail, $displayName, $otp)
 }
 
 /**
- * Gửi Link Reset Password
+ * Gửi Link Reset Password (đã sửa dynamic URL)
  */
 function sendResetLinkEmail($toEmail, $displayName, $reset_token)
 {
     $mail = new PHPMailer(true);
+
+    // Lấy URL động
+    $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'];
+    $resetLink = "$protocol://$host/reset_password.php?token=" . $reset_token;
 
     try {
         $mail->SMTPDebug = 0;
@@ -130,8 +138,6 @@ function sendResetLinkEmail($toEmail, $displayName, $reset_token)
         $mail->CharSet = 'UTF-8';
         $mail->setFrom('trandanh020906@gmail.com', 'Note App');
         $mail->addAddress($toEmail, $displayName);
-
-        $resetLink = "http://localhost/reset_password.php?token=" . $reset_token;
 
         $mail->isHTML(true);
         $mail->Subject = 'Đặt lại mật khẩu - Note App';
@@ -165,6 +171,7 @@ function sendResetLinkEmail($toEmail, $displayName, $reset_token)
         return false;
     }
 }
+
 /**
  * Gửi thông báo mật khẩu đã thay đổi
  */
@@ -201,8 +208,9 @@ function sendPasswordChangedNotification($toEmail, $displayName)
         error_log("Password Changed Notification Error: " . $e->getMessage());
     }
 }
+
 /**
- * Gửi email thông báo khi note được chia sẻ (Better Approach)
+ * Gửi email thông báo khi note được chia sẻ
  */
 function sendShareNotification($toEmail, $displayName, $sharerName, $noteTitle)
 {

@@ -183,29 +183,47 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
                 <?= $message ?>
 
                 <?php if ($step == 1): ?>
-                    <form method="POST">
+                    <form method="POST" id="resetFormStep1">
                         <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
                         <input type="hidden" name="action" value="send_reset">
 
                         <div class="mb-3">
                             <label class="form-label">Nhập email tài khoản</label>
-                            <input type="email" name="email" class="form-control" required>
+                            <input type="email" name="email" id="resetEmailInput" class="form-control" required>
                         </div>
 
                         <div class="mb-3">
                             <label class="form-label">Chọn phương thức khôi phục:</label><br>
                             <div class="form-check">
-                                <input class="form-check-input" type="radio" name="type" value="otp" checked>
-                                <label class="form-check-label">Gửi mã OTP</label>
+                                <input class="form-check-input" type="radio" name="type" value="otp" id="typeOtp" checked>
+                                <label class="form-check-label" for="typeOtp">Gửi mã OTP</label>
                             </div>
                             <div class="form-check">
-                                <input class="form-check-input" type="radio" name="type" value="link">
-                                <label class="form-check-label">Gửi link đặt lại mật khẩu</label>
+                                <input class="form-check-input" type="radio" name="type" value="link" id="typeLink">
+                                <label class="form-check-label" for="typeLink">Gửi link đặt lại mật khẩu</label>
                             </div>
                         </div>
 
                         <button type="submit" class="btn btn-primary w-100">Tiếp tục</button>
                     </form>
+
+                    <div class="text-center mt-3">
+                        <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
+                    </div>
+
+                    <script>
+                        (function() {
+                            const urlParams = new URLSearchParams(window.location.search);
+                            const emailFromProfile = urlParams.get('email');
+                            if (emailFromProfile) {
+                                const emailInput = document.getElementById('resetEmailInput');
+                                if (emailInput) {
+                                    emailInput.value = emailFromProfile;
+                                    // Không khóa readonly để người dùng có thể sửa nếu nhầm
+                                }
+                            }
+                        })();
+                    </script>
 
                 <?php elseif ($step == 2): ?>
                     <form method="POST">
@@ -232,11 +250,11 @@ $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 
                         <button type="submit" class="btn btn-success w-100">Đổi mật khẩu</button>
                     </form>
-                <?php endif; ?>
 
-                <div class="text-center mt-3">
-                    <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
-                </div>
+                    <div class="text-center mt-3">
+                        <a href="login.php" class="text-decoration-none">← Quay lại đăng nhập</a>
+                    </div>
+                <?php endif; ?>
             </div>
         </div>
     </div>

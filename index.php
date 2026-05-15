@@ -121,7 +121,7 @@ $user_avatar = !empty($_SESSION['avatar'])
 
     <div id="notesContainer" class="note-grid-view pb-5"></div>
     <!-- Bulk action toolbar (ẩn mặc định) -->
-<div id="bulkToolbar" class="fixed-bottom mb-3 d-none justify-content-center">
+    <div id="bulkToolbar" class="fixed-bottom mb-3">
     <div class="bg-body-tertiary rounded-pill shadow-lg p-2 d-flex gap-2">
         <button id="bulkDeleteBtn" class="btn btn-sm btn-danger rounded-pill"><i class="bi bi-trash3"></i> Xóa</button>
         <button id="bulkRestoreBtn" class="btn btn-sm btn-success rounded-pill d-none"><i class="bi bi-arrow-counterclockwise"></i> Khôi phục</button>

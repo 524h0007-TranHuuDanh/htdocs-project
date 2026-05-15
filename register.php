@@ -52,6 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     // Auto login
                     $_SESSION['user_id']      = $user_id;
                     $_SESSION['display_name'] = $display_name;
+                    $_SESSION['email']        = $email;   // ← ĐÃ SỬA: thêm email vào session
                     $_SESSION['avatar']       = 'uploads/avatars/default-avatar.png';
                     $_SESSION['font_size']    = '16px';
                     $_SESSION['theme_color']  = 'light';
